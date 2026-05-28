@@ -30,7 +30,7 @@ try:
 
 except Exception as e:
     import traceback
-    print("\n💥 SYSTEM INITIALIZATION CRASH DETECTED:")
+    print("\n SYSTEM INITIALIZATION CRASH DETECTED:")
     traceback.print_exc()
     sys.exit(1)
 
@@ -42,10 +42,10 @@ async def test_cloud_ping():
             active_context=["Hello Kernel"]
         )
         print(f"   -> Cloud Response: {response.text}")
-        print("\n✅ ALL SUB-SYSTEMS VERIFIED SUCCESSFULLY!")
+        print("\n ALL SUB-SYSTEMS VERIFIED SUCCESSFULLY!")
     except Exception as e:
         import traceback
-        print("\n💥 CLOUD NETWORK TRANSACTION CRASH DETECTED:")
+        print("\n CLOUD NETWORK TRANSACTION CRASH DETECTED:")
         traceback.print_exc()
 
 if __name__ == "__main__":
