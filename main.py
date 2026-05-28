@@ -604,7 +604,7 @@ async def main() -> None:
             rows = await process_registry.list_processes()
             if not rows:
                 return "no active agent processes"
-            lines = ["PID   NAME                 STATUS     MODE        UPTIME  TOKENS  MAILBOX"]
+            lines = ["PID   NAME                 STATUS     MODE        UPTIME  TOKENS  MAILBOX    IPC S/R/E"]
             for row in rows:
                 lines.append(
                     f"{row['pid']:<5} "
@@ -613,7 +613,8 @@ async def main() -> None:
                     f"{row['execution_mode']:<11} "
                     f"{row['uptime_seconds']:>5.1f}s "
                     f"{row['memory_tokens']:>6} "
-                    f"{row['mailbox_depth']}/{row['mailbox_size']}"
+                    f"{row['mailbox_depth']}/{row['mailbox_size']:<9} "
+                    f"{row.get('messages_sent', 0)}/{row.get('messages_received', 0)}/{row.get('message_errors', 0)}"
                 )
             return "\n".join(lines)
 

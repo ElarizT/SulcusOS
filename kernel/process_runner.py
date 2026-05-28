@@ -41,12 +41,19 @@ class IsolatedStopEvent:
 
 
 class IsolatedBus:
-    async def recv_message(self, _agent_name: str) -> AgentMessage:
-        await asyncio.sleep(0.25)
-        raise asyncio.TimeoutError
+    def __init__(self, *, inbox: Any, outbox: Any) -> None:
+        self.inbox = inbox
+        self.outbox = outbox
 
-    def send_message(self, _message: AgentMessage) -> None:
-        raise RuntimeError("isolated agent IPC send is not available in this MVP")
+    async def recv_message(self, agent_name: str) -> AgentMessage:
+        try:
+            payload = await asyncio.to_thread(self.inbox.get, True, 0.25)
+        except queue.Empty as exc:
+            raise asyncio.TimeoutError from exc
+        return AgentMessage(agent_name, agent_name, payload)
+
+    def send_message(self, message: AgentMessage) -> None:
+        self.outbox.put_nowait(message.payload)
 
 
 class IsolatedMemory:
@@ -58,7 +65,13 @@ class IsolatedMemory:
         self.active_tokens += max(int(token_estimate), 1)
 
 
-def run_child(config_data: dict[str, Any], status_queue: Any, shutdown_queue: Any) -> None:
+def run_child(
+    config_data: dict[str, Any],
+    status_queue: Any,
+    shutdown_queue: Any,
+    child_inbox: Any,
+    child_outbox: Any,
+) -> None:
     config = RunnerConfig(**config_data)
     _apply_minimal_environment(config.environment)
     try:
@@ -71,7 +84,7 @@ def run_child(config_data: dict[str, Any], status_queue: Any, shutdown_queue: An
 
         process.pid = config.pid
         process.agent_name = name
-        process.bus = IsolatedBus()
+        process.bus = IsolatedBus(inbox=child_inbox, outbox=child_outbox)
         process.memory = IsolatedMemory()
         process.kernel = None
         process.stop_event = IsolatedStopEvent(shutdown_queue)

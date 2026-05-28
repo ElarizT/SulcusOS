@@ -159,7 +159,7 @@ class AgentOSDashboard(App[None]):
         table.add_columns("Agent Name", "Queue Depth", "Routing Method")
         process_table = self.query_one("#process-table", DataTable)
         process_table.cursor_type = "row"
-        process_table.add_columns("PID", "Name", "Status", "Mode", "Uptime", "Tokens", "Mailbox")
+        process_table.add_columns("PID", "Name", "Status", "Mode", "Uptime", "Tokens", "Mailbox", "IPC")
         self.set_interval(0.1, self.refresh_metrics)
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -305,6 +305,7 @@ class AgentOSDashboard(App[None]):
                 f"{uptime:0.1f}s",
                 str(row.get("memory_tokens", 0)),
                 f"{row.get('mailbox_depth', 0)}/{row.get('mailbox_size', 0)}",
+                f"{row.get('messages_sent', 0)}/{row.get('messages_received', 0)}/{row.get('message_errors', 0)}",
             )
 
     def _read_mailboxes(self) -> list[MailboxMetric]:

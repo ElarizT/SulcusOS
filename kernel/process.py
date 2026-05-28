@@ -18,6 +18,19 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+from kernel.ipc_protocol import (
+    ErrorMessage,
+    EventMessage,
+    IPCMessage,
+    IPCProtocolError,
+    TaskRequest,
+    TaskResponse,
+    make_error,
+    make_message,
+    new_message_id,
+    parse_message,
+)
+
 try:
     from agent_os_core import AgentMessage
 except ImportError:
@@ -59,6 +72,7 @@ class AgentProcess:
         self.bus: Any = None
         self.memory: Any = None
         self.kernel: Any = None
+        self.registry: Any = None
         self.stop_event: asyncio.Event | None = None
 
     async def on_start(self) -> None:
@@ -86,16 +100,105 @@ class AgentProcess:
                     )
                 except asyncio.TimeoutError:
                     continue
-                await self.on_message(message)
+                await self.on_message(self._coerce_inbound_message(message))
         finally:
             if started:
                 await self.on_stop()
 
-    def send(self, receiver: str, payload: dict[str, Any]) -> None:
+    def send(
+        self,
+        target_pid: int,
+        payload: Any,
+        message_type: str = "task_request",
+        priority: str = "normal",
+        ttl: float | None = None,
+    ) -> IPCMessage:
         if self.bus is None:
             raise RuntimeError("process was not attached to Agent OS")
-        self.bus.send_message(
-            AgentMessage(self.agent_name, receiver, json.dumps(payload))
+        message = make_message(
+            source_pid=self._require_pid(),
+            target_pid=target_pid,
+            payload=payload,
+            message_type=message_type,
+            priority=priority,
+            ttl=ttl,
+        )
+        if self.registry is not None:
+            return self.registry.route_ipc_message(message)
+        self.bus.send_message(AgentMessage(self.agent_name, str(target_pid), message.to_json()))
+        return message
+
+    async def receive(self, timeout: float | None = None) -> IPCMessage:
+        if self.bus is None:
+            raise RuntimeError("process was not attached to Agent OS")
+        receive = self.bus.recv_message(self.agent_name)
+        raw = await asyncio.wait_for(receive, timeout=timeout) if timeout is not None else await receive
+        return self._coerce_inbound_message(raw)
+
+    async def request(self, target_pid: int, payload: Any, timeout: float | None = None) -> IPCMessage:
+        correlation_id = new_message_id()
+        request = make_message(
+            source_pid=self._require_pid(),
+            target_pid=target_pid,
+            payload=payload,
+            message_type=TaskRequest.message_type,
+            correlation_id=correlation_id,
+            ttl=timeout,
+        )
+        if self.registry is not None:
+            routed = self.registry.route_ipc_message(request)
+            if isinstance(routed, ErrorMessage):
+                return routed
+        else:
+            self.bus.send_message(AgentMessage(self.agent_name, str(target_pid), request.to_json()))
+
+        deadline = time.monotonic() + timeout if timeout is not None else None
+        while True:
+            remaining = None if deadline is None else max(deadline - time.monotonic(), 0.0)
+            if remaining == 0.0:
+                return make_error(
+                    source_pid=self._require_pid(),
+                    target_pid=target_pid,
+                    code="timeout",
+                    message="request timed out while awaiting response",
+                    correlation_id=correlation_id,
+                )
+            try:
+                message = await self.receive(timeout=remaining)
+            except asyncio.TimeoutError:
+                return make_error(
+                    source_pid=self._require_pid(),
+                    target_pid=target_pid,
+                    code="timeout",
+                    message="request timed out while awaiting response",
+                    correlation_id=correlation_id,
+                )
+            if message.correlation_id == correlation_id and message.type in {
+                TaskResponse.message_type,
+                ErrorMessage.message_type,
+            }:
+                return message
+            await self.on_message(message)
+
+    def reply(self, request_message: IPCMessage, payload: Any) -> IPCMessage:
+        response = TaskResponse(
+            source_pid=self._require_pid(),
+            target_pid=request_message.source_pid,
+            payload=payload,
+            correlation_id=request_message.correlation_id,
+            priority=request_message.priority,
+        )
+        if self.registry is not None:
+            return self.registry.route_ipc_message(response)
+        self.bus.send_message(AgentMessage(self.agent_name, str(request_message.source_pid), response.to_json()))
+        return response
+
+    def emit(self, event_name: str, payload: Any) -> IPCMessage:
+        return self.send(
+            1,
+            {"event": event_name, "payload": payload},
+            message_type=EventMessage.message_type,
+            priority="low",
         )
 
     def remember(self, content: dict[str, Any], token_estimate: int = 1) -> None:
@@ -106,6 +209,17 @@ class AgentProcess:
             json.dumps(content),
             max(int(token_estimate), 1),
         )
+
+    def _require_pid(self) -> int:
+        if self.pid is None:
+            raise RuntimeError("process PID is not assigned")
+        return self.pid
+
+    def _coerce_inbound_message(self, message: Any) -> IPCMessage:
+        if isinstance(message, IPCMessage):
+            return message
+        payload = getattr(message, "payload", message)
+        return parse_message(payload)
 
 
 @dataclass
@@ -122,6 +236,8 @@ class ProcessRecord:
     child_process: Any = None
     status_queue: Any = None
     shutdown_queue: Any = None
+    child_inbox: Any = None
+    child_outbox: Any = None
     resources_registered: bool = False
     error: str | None = None
 
@@ -159,6 +275,7 @@ class ProcessRegistry:
         self._next_pid = 100
         self._records: dict[int, ProcessRecord] = {}
         self._by_name: dict[str, int] = {}
+        self._message_stats: dict[int, dict[str, int]] = {}
         self._lock = asyncio.Lock()
 
     async def run_path(self, raw_path: str) -> ProcessRecord:
@@ -220,6 +337,7 @@ class ProcessRegistry:
                 process.bus = self.bus
                 process.memory = self.memory
                 process.kernel = self.kernel
+                process.registry = self
                 process.stop_event = record.stop_event
 
                 task = asyncio.create_task(
@@ -240,6 +358,8 @@ class ProcessRegistry:
 
         status_queue = self._mp_context.Queue()
         shutdown_queue = self._mp_context.Queue()
+        child_inbox = self._mp_context.Queue(maxsize=self.mailbox_size)
+        child_outbox = self._mp_context.Queue(maxsize=self.mailbox_size)
         child = self._mp_context.Process(
             target=_child_entrypoint,
             args=(
@@ -251,6 +371,8 @@ class ProcessRegistry:
                 },
                 status_queue,
                 shutdown_queue,
+                child_inbox,
+                child_outbox,
             ),
             name=f"agent-os-process-{pid}",
         )
@@ -267,6 +389,8 @@ class ProcessRegistry:
             child_process=child,
             status_queue=status_queue,
             shutdown_queue=shutdown_queue,
+            child_inbox=child_inbox,
+            child_outbox=child_outbox,
         )
 
         try:
@@ -349,6 +473,58 @@ class ProcessRegistry:
         await self._reap_finished_children()
         async with self._lock:
             return [self._snapshot(record) for record in sorted(self._records.values(), key=lambda item: item.pid)]
+
+    def route_ipc_message(self, message: IPCMessage) -> IPCMessage:
+        try:
+            message.validate()
+            if message.is_expired():
+                raise IPCProtocolError("timeout", "message expired before delivery")
+            source = self._records.get(message.source_pid)
+            target = self._records.get(message.target_pid)
+            if source is None:
+                raise IPCProtocolError("invalid_message", f"source PID {message.source_pid} is not registered")
+            if target is None:
+                raise IPCProtocolError("target_not_found", f"target PID {message.target_pid} is not registered")
+            if source.state not in {ProcessState.STARTING, ProcessState.RUNNING}:
+                raise IPCProtocolError("process_dead", f"source PID {message.source_pid} is {source.state.value}")
+            if target.state not in {ProcessState.STARTING, ProcessState.RUNNING}:
+                raise IPCProtocolError("process_dead", f"target PID {message.target_pid} is {target.state.value}")
+            self.bus.send_message(AgentMessage(source.name, target.name, message.to_json()))
+            self._bump_message_stat(message.source_pid, "sent")
+            self._bump_message_stat(message.target_pid, "received")
+            return message
+        except IPCProtocolError as exc:
+            return self._protocol_error(message, exc.code, str(exc))
+        except Exception as exc:
+            code = "mailbox_full" if "full" in str(exc).lower() else "invalid_message"
+            return self._protocol_error(message, code, str(exc))
+
+    def send_ipc_message(
+        self,
+        source_pid: int,
+        target_pid: int,
+        payload: Any,
+        message_type: str = TaskRequest.message_type,
+        priority: str = "normal",
+        ttl: float | None = None,
+    ) -> IPCMessage:
+        try:
+            message = make_message(
+                source_pid=source_pid,
+                target_pid=target_pid,
+                payload=payload,
+                message_type=message_type,
+                priority=priority,
+                ttl=ttl,
+            )
+        except IPCProtocolError as exc:
+            return make_error(
+                source_pid=source_pid if isinstance(source_pid, int) and source_pid > 0 else 1,
+                target_pid=target_pid if isinstance(target_pid, int) and target_pid > 0 else 1,
+                code=exc.code,
+                message=str(exc),
+            )
+        return self.route_ipc_message(message)
 
     def _load_process(self, path: Path) -> AgentProcess:
         module_name = f"agent_os_dynamic_{path.stem}_{abs(hash(path))}"
@@ -483,6 +659,7 @@ class ProcessRegistry:
                     if message_type == "exited":
                         record.state = ProcessState.EXITED
                         break
+                await self._bridge_child_ipc(record)
 
                 child = record.child_process
                 if child is not None and not child.is_alive():
@@ -519,6 +696,7 @@ class ProcessRegistry:
     def _snapshot(self, record: ProcessRecord) -> dict[str, Any]:
         mailbox = self._mailbox_snapshot(record.name)
         memory = self._memory_snapshot(record.name)
+        stats = self._message_stats.get(record.pid, {})
         return {
             "pid": record.pid,
             "name": record.name,
@@ -528,9 +706,31 @@ class ProcessRegistry:
             "memory_tokens": memory.get("current_active_tokens", 0),
             "mailbox_depth": mailbox.get("queue_depth", 0),
             "mailbox_size": mailbox.get("buffer_size", record.mailbox_size),
+            "messages_sent": stats.get("sent", 0),
+            "messages_received": stats.get("received", 0),
+            "message_errors": stats.get("errors", 0),
             "path": str(record.path),
             "error": record.error,
         }
+
+    async def _bridge_child_ipc(self, record: ProcessRecord) -> None:
+        if record.child_inbox is None or record.child_outbox is None:
+            return
+        with contextlib.suppress(asyncio.TimeoutError):
+            message = await asyncio.wait_for(self.bus.recv_message(record.name), timeout=0.01)
+            try:
+                record.child_inbox.put_nowait(message.payload)
+            except Exception:
+                self._bump_message_stat(record.pid, "errors")
+        while True:
+            try:
+                raw = record.child_outbox.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                self.route_ipc_message(parse_message(raw))
+            except IPCProtocolError as exc:
+                self._bump_message_stat(record.pid, "errors")
 
     def _mailbox_snapshot(self, name: str) -> dict[str, Any]:
         for agent_name, queue_depth, buffer_size, routing_method in self.bus.get_mailbox_metrics():
@@ -603,6 +803,19 @@ class ProcessRegistry:
         env["AGENT_OS_CHILD_PROCESS"] = "1"
         return env
 
+    def _bump_message_stat(self, pid: int, key: str) -> None:
+        self._message_stats.setdefault(pid, {"sent": 0, "received": 0, "errors": 0})[key] += 1
+
+    def _protocol_error(self, message: IPCMessage, code: str, text: str) -> ErrorMessage:
+        self._bump_message_stat(message.source_pid, "errors")
+        return make_error(
+            source_pid=message.target_pid,
+            target_pid=message.source_pid,
+            code=code,
+            message=text,
+            correlation_id=message.correlation_id,
+        )
+
 
 def _is_relative_to(path: Path, root: Path) -> bool:
     if hasattr(path, "is_relative_to"):
@@ -622,7 +835,13 @@ def _base_name(node: ast.expr) -> str:
     return ""
 
 
-def _child_entrypoint(config: dict[str, Any], status_queue: Any, shutdown_queue: Any) -> None:
+def _child_entrypoint(
+    config: dict[str, Any],
+    status_queue: Any,
+    shutdown_queue: Any,
+    child_inbox: Any,
+    child_outbox: Any,
+) -> None:
     from kernel.process_runner import run_child
 
-    run_child(config, status_queue, shutdown_queue)
+    run_child(config, status_queue, shutdown_queue, child_inbox, child_outbox)
