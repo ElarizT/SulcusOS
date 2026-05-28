@@ -121,6 +121,11 @@ impl ContextMemoryManager {
         Ok(())
     }
 
+    pub fn unregister_agent(&self, agent_name: String) -> PyResult<bool> {
+        let mut page_tables = self.page_tables.lock().map_err(lock_error)?;
+        Ok(page_tables.remove(&agent_name).is_some())
+    }
+
     pub fn append_context_frame(
         &self,
         agent_name: String,

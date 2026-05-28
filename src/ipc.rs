@@ -62,6 +62,10 @@ impl RustKernel {
             .register_agent_capability(agent_name, capability)
     }
 
+    pub fn unregister_agent(&self, agent_name: String) -> PyResult<()> {
+        self.inner.unregister_agent(&agent_name)
+    }
+
     pub fn find_agents_by_capability(&self, capability: String) -> PyResult<Vec<String>> {
         self.inner.find_agents_by_capability(&capability)
     }
@@ -140,6 +144,19 @@ impl NativeIPCBus {
         self.inner.kernel.register_agent(agent_name)?;
 
         Ok(())
+    }
+
+    pub fn unregister_mailbox(&self, agent_name: String) -> PyResult<bool> {
+        let mut senders = self.inner.senders.lock().map_err(lock_error)?;
+        let mut receivers = self.inner.receivers.lock().map_err(lock_error)?;
+        let mut routing_methods = self.inner.routing_methods.lock().map_err(lock_error)?;
+
+        let removed = senders.remove(&agent_name).is_some();
+        receivers.remove(&agent_name);
+        routing_methods.remove(&agent_name);
+        self.inner.kernel.unregister_agent(&agent_name)?;
+
+        Ok(removed)
     }
 
     pub fn send_message(&self, msg: PyRef<'_, AgentMessage>) -> PyResult<()> {
@@ -299,6 +316,21 @@ impl KernelInner {
             .or_default()
             .insert(agent_name.clone());
         self.register_agent(agent_name)?;
+
+        Ok(())
+    }
+
+    fn unregister_agent(&self, agent_name: &str) -> PyResult<()> {
+        self.registered_agents
+            .lock()
+            .map_err(lock_error)?
+            .remove(agent_name);
+
+        let mut capability_agents = self.capability_agents.lock().map_err(lock_error)?;
+        capability_agents.retain(|_, agents| {
+            agents.remove(agent_name);
+            !agents.is_empty()
+        });
 
         Ok(())
     }

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Container, Vertical
-from textual.widgets import DataTable, Footer, Header, RichLog, Static
+from textual.widgets import DataTable, Footer, Header, Input, RichLog, Static
 
 
 @dataclass
@@ -45,9 +46,9 @@ class AgentOSDashboard(App[None]):
 
     #main-grid {
         layout: grid;
-        grid-size: 2 2;
+        grid-size: 2 3;
         grid-columns: 1fr 1fr;
-        grid-rows: 2fr 1fr;
+        grid-rows: 2fr 1fr 1fr;
         height: 1fr;
     }
 
@@ -72,6 +73,11 @@ class AgentOSDashboard(App[None]):
         row-span: 1;
     }
 
+    #process-pane {
+        column-span: 2;
+        row-span: 1;
+    }
+
     .pane-title {
         height: 1;
         color: #8bd5ff;
@@ -91,19 +97,42 @@ class AgentOSDashboard(App[None]):
         height: 1fr;
         background: #080b0f;
     }
+
+    #process-table {
+        height: 1fr;
+    }
+
+    #shell-input {
+        dock: bottom;
+        height: 3;
+        border-top: solid #263245;
+        background: #101722;
+    }
     """
 
     BINDINGS = [("q", "quit", "Quit")]
 
-    def __init__(self, *, kernel: Any, bus: Any, memory: Any, sandbox: Any) -> None:
+    def __init__(
+        self,
+        *,
+        kernel: Any,
+        bus: Any,
+        memory: Any,
+        sandbox: Any,
+        command_handler: Callable[[str], Awaitable[str] | str] | None = None,
+        process_snapshot: Callable[[], Awaitable[list[dict[str, Any]]] | list[dict[str, Any]]] | None = None,
+    ) -> None:
         super().__init__()
         self.kernel = kernel
         self.bus = bus
         self.memory = memory
         self.sandbox = sandbox
+        self.command_handler = command_handler
+        self.process_snapshot = process_snapshot
         self._heartbeat_index = 0
         self._last_pending_evictions: dict[str, int] = {}
         self._logged_wasm_runs = 0
+        self._process_rows: list[dict[str, Any]] = []
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -118,13 +147,43 @@ class AgentOSDashboard(App[None]):
             with Vertical(id="wasm-pane", classes="pane"):
                 yield Static("WASM Execution Shield Matrix", classes="pane-title")
                 yield RichLog(id="wasm-log", markup=True, wrap=True, highlight=True)
+            with Vertical(id="process-pane", classes="pane"):
+                yield Static("Process Registry", classes="pane-title")
+                yield DataTable(id="process-table")
+        yield Input(placeholder="agent-os> run <path> | ps | kill <PID>", id="shell-input")
         yield Footer()
 
     def on_mount(self) -> None:
         table = self.query_one("#ipc-table", DataTable)
         table.cursor_type = "row"
         table.add_columns("Agent Name", "Queue Depth", "Routing Method")
+        process_table = self.query_one("#process-table", DataTable)
+        process_table.cursor_type = "row"
+        process_table.add_columns("PID", "Name", "Status", "Mode", "Uptime", "Tokens", "Mailbox")
         self.set_interval(0.1, self.refresh_metrics)
+
+    async def on_input_submitted(self, event: Input.Submitted) -> None:
+        command = event.value.strip()
+        event.input.value = ""
+        if not command:
+            return
+        log = self.query_one("#wasm-log", RichLog)
+        log.write(f"[bold #8bd5ff]agent-os>[/] {command}")
+
+        if self.command_handler is None:
+            log.write("[yellow]No command handler is attached.[/]")
+            return
+
+        try:
+            result = self.command_handler(command)
+            if hasattr(result, "__await__"):
+                result = await result  # type: ignore[assignment,misc]
+        except Exception as exc:
+            log.write(f"[bold red]error:[/] {exc}")
+            return
+
+        if result:
+            log.write(str(result))
 
     def refresh_metrics(self) -> None:
         mailboxes = self._read_mailboxes()
@@ -135,6 +194,21 @@ class AgentOSDashboard(App[None]):
         self._render_mailboxes(mailboxes)
         self._render_memory(memory_agents)
         self._render_wasm_log(wasm_runs)
+        self.run_worker(self._refresh_process_rows(), exclusive=True, group="process-refresh")
+
+    async def _refresh_process_rows(self) -> None:
+        if self.process_snapshot is None:
+            self._process_rows = []
+            self._render_processes([])
+            return
+        try:
+            rows = self.process_snapshot()
+            if hasattr(rows, "__await__"):
+                rows = await rows  # type: ignore[assignment,misc]
+            self._process_rows = list(rows)
+        except Exception:
+            self._process_rows = []
+        self._render_processes(self._process_rows)
 
     def _render_status(self, mailboxes: list[MailboxMetric]) -> None:
         heartbeats = ["|", "/", "-", "\\"]
@@ -208,6 +282,30 @@ class AgentOSDashboard(App[None]):
                 f"Fuel Consumed: [bold]{run.fuel_consumed}[/]{error}"
             )
         self._logged_wasm_runs = len(runs)
+
+    def _render_processes(self, rows: list[dict[str, Any]]) -> None:
+        table = self.query_one("#process-table", DataTable)
+        table.clear()
+        for row in rows:
+            status = str(row.get("status", "unknown"))
+            status_style = {
+                "running": "green",
+                "starting": "yellow",
+                "stopping": "yellow",
+                "killed": "dim",
+                "crashed": "bold red",
+                "exited": "dim",
+            }.get(status, "white")
+            uptime = float(row.get("uptime_seconds", 0.0))
+            table.add_row(
+                str(row.get("pid", "")),
+                str(row.get("name", "")),
+                Text(status, style=status_style),
+                str(row.get("execution_mode", "")),
+                f"{uptime:0.1f}s",
+                str(row.get("memory_tokens", 0)),
+                f"{row.get('mailbox_depth', 0)}/{row.get('mailbox_size', 0)}",
+            )
 
     def _read_mailboxes(self) -> list[MailboxMetric]:
         raw_metrics = self._safe_call(self.bus, "get_mailbox_metrics", default=[])

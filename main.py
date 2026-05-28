@@ -5,6 +5,7 @@ import contextlib
 import json
 import os
 import signal
+import shlex
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,7 @@ from agent_os_core import (
     WasmSandboxManager,
 )
 from kernel.dashboard import AgentOSDashboard
+from kernel.process import ProcessRegistry
 
 try:
     from kernel.llm import AsyncLLMManager, LLMConfig, normalize_code_block
@@ -41,6 +43,10 @@ DEFAULT_AGENT_TOKEN_BUDGET = int(os.getenv("AGENT_OS_AGENT_TOKEN_BUDGET", "8000"
 DEFAULT_SANDBOX_FUEL = int(os.getenv("AGENT_OS_SANDBOX_FUEL", "50000"))
 HOST_IDLE_SECONDS = float(os.getenv("AGENT_OS_HOST_IDLE_SECONDS", "0.25"))
 HOST_RETRY_SECONDS = float(os.getenv("AGENT_OS_HOST_RETRY_SECONDS", "3.0"))
+ENABLE_LEGACY_MANIFEST_AGENTS = os.getenv("AGENT_OS_ENABLE_LEGACY_AGENTS", "0") == "1"
+AGENT_PROCESS_ROOT = Path(os.getenv("AGENT_OS_PROCESS_ROOT", ".")).resolve()
+AGENT_PROCESS_ISOLATION = os.getenv("AGENT_OS_PROCESS_ISOLATION", "in-process")
+AGENT_PROCESS_STARTUP_TIMEOUT = float(os.getenv("AGENT_OS_PROCESS_STARTUP_TIMEOUT", "5.0"))
 
 COMPILER_RULES = (
     "CRITICAL COMPILER RULES:\n"
@@ -210,6 +216,18 @@ def register_runtime_agents(
         memory.register_agent(agent.name, DEFAULT_AGENT_TOKEN_BUDGET)
         for capability in agent.capabilities:
             kernel.register_agent_capability(agent.name, capability)
+
+
+def register_control_plane(
+    kernel: RustKernel,
+    bus: NativeIPCBus,
+    memory: ContextMemoryManager,
+) -> None:
+    bus.register_mailbox(SYSTEM_AGENT_NAME, DEFAULT_MAILBOX_SIZE)
+    bus.register_mailbox(ORCHESTRATOR_AGENT_NAME, DEFAULT_MAILBOX_SIZE)
+    kernel.register_agent_capability(ORCHESTRATOR_AGENT_NAME, "orchestration")
+    memory.register_agent(SYSTEM_AGENT_NAME, DEFAULT_AGENT_TOKEN_BUDGET)
+    memory.register_agent(ORCHESTRATOR_AGENT_NAME, DEFAULT_AGENT_TOKEN_BUDGET)
 
 
 def normalize_route_text(text: str) -> set[str]:
@@ -541,43 +559,134 @@ async def main() -> None:
     except NotImplementedError:
         signal.signal(signal.SIGINT, lambda _signum, _frame: request_shutdown())
 
-    agent_specs = load_agent_manifest()
-    registry = DynamicAgentRegistry(agent_specs)
+    agent_specs: list[AgentSpec] = []
+    legacy_registry: DynamicAgentRegistry | None = None
+    if ENABLE_LEGACY_MANIFEST_AGENTS:
+        agent_specs = load_agent_manifest()
+        legacy_registry = DynamicAgentRegistry(agent_specs)
     kernel = RustKernel()
     bus = create_bus(kernel)
     memory = ContextMemoryManager(max_active_tokens=DEFAULT_AGENT_TOKEN_BUDGET)
     sandbox = WasmSandboxManager()
-    register_runtime_agents(registry, kernel, bus, memory)
+    if legacy_registry is not None:
+        register_runtime_agents(legacy_registry, kernel, bus, memory)
+    else:
+        register_control_plane(kernel, bus, memory)
 
-    app = AgentOSDashboard(kernel=kernel, bus=bus, memory=memory, sandbox=sandbox)
-    seed_boot_task(bus, registry)
+    process_registry = ProcessRegistry(
+        kernel=kernel,
+        bus=bus,
+        memory=memory,
+        mailbox_size=DEFAULT_MAILBOX_SIZE,
+        token_budget=DEFAULT_AGENT_TOKEN_BUDGET,
+        allowed_roots=[AGENT_PROCESS_ROOT],
+        execution_mode="isolated" if AGENT_PROCESS_ISOLATION == "process" else "in-process",
+        startup_timeout_seconds=AGENT_PROCESS_STARTUP_TIMEOUT,
+    )
+
+    async def handle_shell_command(command: str) -> str:
+        try:
+            parts = shlex.split(command)
+        except ValueError as exc:
+            raise ValueError(f"could not parse command: {exc}") from exc
+        if not parts:
+            return ""
+        verb = parts[0].lower()
+        argument = parts[1] if len(parts) > 1 else ""
+
+        if verb == "run":
+            if len(parts) != 2:
+                raise ValueError("usage: run <path-to-agent.py>")
+            record = await process_registry.run_path(argument)
+            return f"started PID {record.pid} ({record.name}) from {record.path}"
+
+        if verb == "ps":
+            rows = await process_registry.list_processes()
+            if not rows:
+                return "no active agent processes"
+            lines = ["PID   NAME                 STATUS     MODE        UPTIME  TOKENS  MAILBOX"]
+            for row in rows:
+                lines.append(
+                    f"{row['pid']:<5} "
+                    f"{row['name'][:20]:<20} "
+                    f"{row['status']:<10} "
+                    f"{row['execution_mode']:<11} "
+                    f"{row['uptime_seconds']:>5.1f}s "
+                    f"{row['memory_tokens']:>6} "
+                    f"{row['mailbox_depth']}/{row['mailbox_size']}"
+                )
+            return "\n".join(lines)
+
+        if verb == "kill":
+            if len(parts) != 2:
+                raise ValueError("usage: kill <PID>")
+            try:
+                pid = int(argument)
+            except ValueError as exc:
+                raise ValueError("PID must be an integer") from exc
+            record = await process_registry.kill(pid)
+            return f"killed PID {record.pid} ({record.name})"
+
+        if verb in {"help", "?"}:
+            return (
+                "commands:\n"
+                "  run <path-to-agent.py>  start an AgentProcess script under "
+                f"{AGENT_PROCESS_ROOT}\n"
+                "  ps                      list process registry status\n"
+                "  kill <PID>              gracefully stop and unregister a process\n"
+                "\n"
+                "execution modes:\n"
+                "  AGENT_OS_PROCESS_ISOLATION=in-process  trusted local mode (default)\n"
+                "  AGENT_OS_PROCESS_ISOLATION=process     spawned child process isolation"
+            )
+
+        raise ValueError("unknown command; try: help")
+
+    app = AgentOSDashboard(
+        kernel=kernel,
+        bus=bus,
+        memory=memory,
+        sandbox=sandbox,
+        command_handler=handle_shell_command,
+        process_snapshot=process_registry.list_processes,
+    )
+    if legacy_registry is not None:
+        seed_boot_task(bus, legacy_registry)
 
     tasks: list[asyncio.Task[Any]] = [
         asyncio.create_task(app.run_async(), name="tui:dashboard"),
-        asyncio.create_task(orchestration_router(registry, bus, memory, stop_event), name="control:router"),
         asyncio.create_task(optional_stdin_ingress(bus, stop_event), name="control:stdin"),
     ]
+    if legacy_registry is not None:
+        tasks.append(
+            asyncio.create_task(
+                orchestration_router(legacy_registry, bus, memory, stop_event),
+                name="control:router",
+            )
+        )
 
     try:
         if AsyncLLMManager is None:
-            raise RuntimeError("AsyncLLMManager import failed")
-        llm_manager = AsyncLLMManager(build_llm_config())
-        for agent in registry.agent_specs:
-            tasks.append(
-                asyncio.create_task(
-                    universal_agent_host(
-                        agent.name,
-                        agent.system_prompt,
-                        agent.capabilities,
-                        kernel,
-                        bus,
-                        memory,
-                        sandbox,
-                        llm_manager,
-                    ),
-                    name=f"agent:{agent.name}",
+            if legacy_registry is not None:
+                raise RuntimeError("AsyncLLMManager import failed")
+        if legacy_registry is not None:
+            llm_manager = AsyncLLMManager(build_llm_config())
+            for agent in legacy_registry.agent_specs:
+                tasks.append(
+                    asyncio.create_task(
+                        universal_agent_host(
+                            agent.name,
+                            agent.system_prompt,
+                            agent.capabilities,
+                            kernel,
+                            bus,
+                            memory,
+                            sandbox,
+                            llm_manager,
+                        ),
+                        name=f"agent:{agent.name}",
+                    )
                 )
-            )
 
         done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
@@ -594,7 +703,8 @@ async def main() -> None:
             task.cancel()
 
         await asyncio.gather(*tasks, return_exceptions=True)
-        for agent_name in [SYSTEM_AGENT_NAME, ORCHESTRATOR_AGENT_NAME, *registry.names]:
+        legacy_names = legacy_registry.names if legacy_registry is not None else []
+        for agent_name in [SYSTEM_AGENT_NAME, ORCHESTRATOR_AGENT_NAME, *legacy_names]:
             with contextlib.suppress(Exception):
                 await drain_mailbox(bus, agent_name)
         if llm_manager is not None:
