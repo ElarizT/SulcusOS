@@ -21,6 +21,7 @@ A lightweight hybrid runtime that combines:
 - `docs/interactive_shell.md` covers the process shell and isolation modes.
 - `docs/ipc_protocol.md` covers the structured Agent-to-Agent IPC protocol.
 - `docs/supervision.md` covers supervisor trees and restart policies.
+- `docs/persistent_memory.md` covers tiered persistent memory paging.
 
 ## Requirements
 

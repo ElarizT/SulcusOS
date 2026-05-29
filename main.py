@@ -19,6 +19,7 @@ from agent_os_core import (
     WasmSandboxManager,
 )
 from kernel.dashboard import AgentOSDashboard
+from kernel.memory_store import PersistentMemoryManager
 from kernel.process import ProcessRegistry
 
 try:
@@ -47,6 +48,7 @@ ENABLE_LEGACY_MANIFEST_AGENTS = os.getenv("AGENT_OS_ENABLE_LEGACY_AGENTS", "0") 
 AGENT_PROCESS_ROOT = Path(os.getenv("AGENT_OS_PROCESS_ROOT", ".")).resolve()
 AGENT_PROCESS_ISOLATION = os.getenv("AGENT_OS_PROCESS_ISOLATION", "in-process")
 AGENT_PROCESS_STARTUP_TIMEOUT = float(os.getenv("AGENT_OS_PROCESS_STARTUP_TIMEOUT", "5.0"))
+AGENT_OS_MEMORY_DIR = Path(os.getenv("AGENT_OS_MEMORY_DIR", ".agent_os/memory"))
 
 COMPILER_RULES = (
     "CRITICAL COMPILER RULES:\n"
@@ -566,7 +568,7 @@ async def main() -> None:
         legacy_registry = DynamicAgentRegistry(agent_specs)
     kernel = RustKernel()
     bus = create_bus(kernel)
-    memory = ContextMemoryManager(max_active_tokens=DEFAULT_AGENT_TOKEN_BUDGET)
+    memory = PersistentMemoryManager(memory_dir=AGENT_OS_MEMORY_DIR)
     sandbox = WasmSandboxManager()
     if legacy_registry is not None:
         register_runtime_agents(legacy_registry, kernel, bus, memory)
@@ -604,7 +606,7 @@ async def main() -> None:
             rows = await process_registry.list_processes()
             if not rows:
                 return "no active agent processes"
-            lines = ["PID   NAME                 STATUS     MODE        PPID  KIDS  RST  STRATEGY      MAILBOX    IPC S/R/E"]
+            lines = ["PID   NAME                 STATUS     MODE        PPID  KIDS  RST  STRATEGY      MEMORY H/P  IPC S/R/E"]
             for row in rows:
                 depth = int(row.get("tree_depth", 0))
                 display_name = f"{'  ' * depth}{row['name'][:20]}"
@@ -618,7 +620,7 @@ async def main() -> None:
                     f"{row.get('child_count', 0):>4} "
                     f"{row.get('restart_count', 0):>3} "
                     f"{row.get('supervisor_strategy', ''):<13} "
-                    f"{row['mailbox_depth']}/{row['mailbox_size']:<9} "
+                    f"{row.get('memory_hot_tokens', row.get('memory_tokens', 0))}/{row.get('memory_paged_count', 0):<9} "
                     f"{row.get('messages_sent', 0)}/{row.get('messages_received', 0)}/{row.get('message_errors', 0)}"
                 )
             return "\n".join(lines)

@@ -160,7 +160,7 @@ class AgentOSDashboard(App[None]):
         process_table = self.query_one("#process-table", DataTable)
         process_table.cursor_type = "row"
         process_table.add_columns(
-            "PID", "Name", "Status", "Mode", "Parent", "Kids", "Restarts", "Strategy", "Mailbox", "IPC"
+            "PID", "Name", "Status", "Mode", "Parent", "Kids", "Restarts", "Strategy", "Memory", "IPC"
         )
         self.set_interval(0.1, self.refresh_metrics)
 
@@ -309,7 +309,7 @@ class AgentOSDashboard(App[None]):
                 str(row.get("child_count", 0)),
                 str(row.get("restart_count", 0)),
                 str(row.get("supervisor_strategy", "")),
-                f"{row.get('mailbox_depth', 0)}/{row.get('mailbox_size', 0)}",
+                f"{row.get('memory_hot_tokens', row.get('memory_tokens', 0))}/{row.get('memory_paged_count', 0)}",
                 f"{row.get('messages_sent', 0)}/{row.get('messages_received', 0)}/{row.get('message_errors', 0)}",
             )
 

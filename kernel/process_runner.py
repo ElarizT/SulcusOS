@@ -100,6 +100,7 @@ def run_child(
                 "max_restarts": int(getattr(process, "max_restarts", 3) or 3),
                 "restart_window_seconds": float(getattr(process, "restart_window_seconds", 60.0) or 60.0),
                 "restart_backoff_seconds": float(getattr(process, "restart_backoff_seconds", 0.0) or 0.0),
+                "memory_restore_policy": str(getattr(process, "memory_restore_policy", "none") or "none"),
             }
         )
         asyncio.run(process.run())

@@ -81,6 +81,7 @@ class AgentProcess:
     max_restarts = 3
     restart_window_seconds = 60.0
     restart_backoff_seconds = 0.0
+    memory_restore_policy = "none"
 
     def __init__(self) -> None:
         self.pid: int | None = None
@@ -249,14 +250,83 @@ class AgentProcess:
             raise RuntimeError("child termination requires registry-attached trusted mode")
         await self.registry.terminate_child(self._require_pid(), pid)
 
-    def remember(self, content: dict[str, Any], token_estimate: int = 1) -> None:
+    def remember(
+        self,
+        content: Any,
+        token_estimate: int = 1,
+        *,
+        importance: float = 0.5,
+        tags: list[str] | tuple[str, ...] | None = None,
+        source: dict[str, Any] | None = None,
+    ) -> None:
         if self.memory is None:
             raise RuntimeError("process was not attached to Agent OS")
-        self.memory.append_context_frame(
-            self.agent_name,
-            json.dumps(content),
-            max(int(token_estimate), 1),
-        )
+        evicted = False
+        if hasattr(self.memory, "append_context_frame"):
+            try:
+                evicted = bool(self.memory.append_context_frame(
+                    self.agent_name,
+                    content,
+                    max(int(token_estimate), 1),
+                    importance=importance,
+                    tags=tags,
+                    source=source,
+                ))
+            except TypeError:
+                evicted = bool(self.memory.append_context_frame(
+                    self.agent_name,
+                    json.dumps(content),
+                    max(int(token_estimate), 1),
+                ))
+        if self.registry is not None:
+            self.registry.emit_memory_event(
+                self._require_pid(),
+                "memory_recorded",
+                {"tags": list(tags or []), "token_estimate": max(int(token_estimate), 1)},
+            )
+            if evicted:
+                self.registry.emit_memory_event(
+                    self._require_pid(),
+                    "memory_evicted",
+                    {"reason": "token_budget"},
+                )
+
+    def recall(
+        self,
+        query: str | None = None,
+        *,
+        tags: list[str] | tuple[str, ...] | None = None,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        if self.memory is None or not hasattr(self.memory, "recall"):
+            return []
+        recalled = list(self.memory.recall(self.agent_name, query=query, tags=tags, limit=limit))
+        if self.registry is not None:
+            self.registry.emit_memory_event(
+                self._require_pid(),
+                "memory_recalled",
+                {"query": query, "tags": list(tags or []), "count": len(recalled)},
+            )
+        return recalled
+
+    def forget(self, memory_id: str) -> bool:
+        if self.memory is None or not hasattr(self.memory, "forget"):
+            return False
+        forgotten = bool(self.memory.forget(memory_id))
+        if forgotten and self.registry is not None:
+            self.registry.emit_memory_event(
+                self._require_pid(),
+                "memory_forgotten",
+                {"memory_id": memory_id},
+            )
+        return forgotten
+
+    def memory_stats(self) -> dict[str, Any]:
+        if self.memory is None:
+            return {}
+        with contextlib.suppress(Exception):
+            return dict(self.memory.get_page_table_summary(self.agent_name))
+        return {}
 
     def _require_pid(self) -> int:
         if self.pid is None:
@@ -298,6 +368,8 @@ class ProcessRecord:
     restart_window_seconds: float = 60.0
     restart_backoff_seconds: float = 0.0
     escalated: bool = False
+    memory_restore_policy: str = "none"
+    latest_snapshot_id: str | None = None
 
     @property
     def uptime_seconds(self) -> float:
@@ -413,11 +485,13 @@ class ProcessRegistry:
                 max_restarts=int(getattr(process, "max_restarts", 3) or 3),
                 restart_window_seconds=float(getattr(process, "restart_window_seconds", 60.0) or 60.0),
                 restart_backoff_seconds=float(getattr(process, "restart_backoff_seconds", 0.0) or 0.0),
+                memory_restore_policy=str(getattr(process, "memory_restore_policy", "none") or "none"),
             )
 
             try:
                 self.bus.register_mailbox(name, mailbox_size)
                 self.memory.register_agent(name, token_budget)
+                self._bind_memory_process(name, pid)
                 for capability in capabilities:
                     if capability.strip():
                         self.kernel.register_agent_capability(name, capability.strip())
@@ -536,8 +610,10 @@ class ProcessRegistry:
                 record.max_restarts = int(message.get("max_restarts", 3) or 3)
                 record.restart_window_seconds = float(message.get("restart_window_seconds", 60.0) or 60.0)
                 record.restart_backoff_seconds = float(message.get("restart_backoff_seconds", 0.0) or 0.0)
+                record.memory_restore_policy = str(message.get("memory_restore_policy", "none") or "none")
                 self.bus.register_mailbox(name, mailbox_size)
                 self.memory.register_agent(name, token_budget)
+                self._bind_memory_process(name, pid)
                 for capability in capabilities:
                     if capability.strip():
                         self.kernel.register_agent_capability(name, capability.strip())
@@ -794,6 +870,13 @@ class ProcessRegistry:
             raise ValueError("agent process restart_window_seconds must be greater than zero")
         if float(getattr(process, "restart_backoff_seconds", 0.0) or 0.0) < 0:
             raise ValueError("agent process restart_backoff_seconds must be non-negative")
+        if str(getattr(process, "memory_restore_policy", "none") or "none") not in {
+            "none",
+            "hot_only",
+            "latest_snapshot",
+            "persistent_recall",
+        }:
+            raise ValueError("agent process memory_restore_policy is unsupported")
 
     def _validate_metadata(
         self,
@@ -1038,6 +1121,7 @@ class ProcessRegistry:
             execution_mode=child.execution_mode,
         )
         replacement.restart_count = child.restart_count + 1
+        self._restore_memory_for_restarted_child(child, replacement)
         async with self._lock:
             if child.pid in parent.child_pids:
                 index = parent.child_pids.index(child.pid)
@@ -1049,6 +1133,71 @@ class ProcessRegistry:
                 pid for pid in parent.child_pids if not (pid in seen or seen.add(pid))
             ]
         return replacement
+
+    def snapshot_process(self, pid: int) -> str:
+        record = self._records.get(pid)
+        if record is None:
+            raise KeyError(f"unknown PID {pid}")
+        if not hasattr(self.memory, "snapshot_process"):
+            raise RuntimeError("memory manager does not support snapshots")
+        snapshot_id = str(self.memory.snapshot_process(pid, record.name))
+        record.latest_snapshot_id = snapshot_id
+        self._emit_memory_event("memory_snapshot_created", record, {"snapshot_id": snapshot_id})
+        return snapshot_id
+
+    def restore_process_memory(self, pid: int, snapshot_id: str | None = None) -> str | None:
+        record = self._records.get(pid)
+        if record is None:
+            raise KeyError(f"unknown PID {pid}")
+        if not hasattr(self.memory, "restore_process_memory"):
+            return None
+        restored = self.memory.restore_process_memory(pid, record.name, snapshot_id)
+        if restored is not None:
+            record.latest_snapshot_id = str(restored)
+            self._emit_memory_event("memory_restored", record, {"snapshot_id": str(restored)})
+        return None if restored is None else str(restored)
+
+    def emit_memory_event(self, pid: int, event_name: str, details: dict[str, Any]) -> None:
+        record = self._records.get(pid)
+        if record is None:
+            return
+        self._emit_memory_event(event_name, record, details)
+
+    def _restore_memory_for_restarted_child(self, old: ProcessRecord, new: ProcessRecord) -> None:
+        policy = new.memory_restore_policy or old.memory_restore_policy
+        if policy == "none":
+            return
+        if policy == "latest_snapshot":
+            if hasattr(self.memory, "restore_process_memory"):
+                restored = self.memory.restore_process_memory(new.pid, new.name, old.latest_snapshot_id)
+                if restored is not None:
+                    new.latest_snapshot_id = str(restored)
+                    self._emit_memory_event("memory_restored", new, {"snapshot_id": str(restored)})
+        elif policy == "hot_only":
+            if hasattr(self.memory, "restore_process_memory"):
+                restored = self.memory.restore_process_memory(
+                    new.pid,
+                    new.name,
+                    old.latest_snapshot_id,
+                    hot_only=True,
+                )
+                if restored is not None:
+                    new.latest_snapshot_id = str(restored)
+                    self._emit_memory_event("memory_restored", new, {"snapshot_id": str(restored)})
+        elif policy == "persistent_recall" and hasattr(self.memory, "recall"):
+            recalled = self.memory.recall(new.name, limit=5)
+            for item in recalled:
+                with contextlib.suppress(Exception):
+                    self.memory.append_context_frame(
+                        new.name,
+                        item.get("content"),
+                        int(item.get("token_estimate", 1)),
+                        importance=float(item.get("importance", 0.5)),
+                        tags=list(item.get("tags", [])),
+                        source={"restored_from": item.get("memory_id")},
+                    )
+            if recalled:
+                self._emit_memory_event("memory_restored", new, {"records": len(recalled)})
 
     def _link_child_locked(self, parent_pid: int, child_pid: int) -> None:
         parent = self._records.get(parent_pid)
@@ -1112,6 +1261,18 @@ class ProcessRegistry:
         except Exception:
             self._bump_message_stat(record.pid, "errors")
 
+    def _emit_memory_event(self, event_name: str, record: ProcessRecord, details: dict[str, Any]) -> None:
+        self._emit_supervision_event_locked(
+            event_name,
+            record,
+            details=details,
+        )
+
+    def _bind_memory_process(self, name: str, pid: int) -> None:
+        if hasattr(self.memory, "bind_process"):
+            with contextlib.suppress(Exception):
+                self.memory.bind_process(name, pid)
+
     def _allocate_pid(self) -> int:
         pid = self._next_pid
         self._next_pid += 1
@@ -1128,6 +1289,11 @@ class ProcessRegistry:
             "execution_mode": record.execution_mode.value,
             "uptime_seconds": record.uptime_seconds,
             "memory_tokens": memory.get("current_active_tokens", 0),
+            "memory_hot_tokens": memory.get("current_active_tokens", 0),
+            "memory_paged_count": memory.get("paged_out_frames", 0),
+            "memory_snapshot_count": memory.get("snapshot_count", 0),
+            "memory_last_eviction_time": memory.get("last_eviction_time"),
+            "memory_store_size_bytes": memory.get("memory_store_size_bytes", 0),
             "mailbox_depth": mailbox.get("queue_depth", 0),
             "mailbox_size": mailbox.get("buffer_size", record.mailbox_size),
             "messages_sent": stats.get("sent", 0),
