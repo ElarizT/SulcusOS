@@ -516,7 +516,7 @@ class ProcessRegistry:
                     self._link_child_locked(parent_pid, pid)
                 self._emit_supervision_event_locked("process_started", record)
             except Exception:
-                await self._cleanup_locked(record)
+                await self._rollback_startup_locked(record)
                 raise
             return record
 
@@ -632,7 +632,7 @@ class ProcessRegistry:
         except Exception:
             await self._stop_child(record)
             async with self._lock:
-                await self._cleanup_locked(record)
+                await self._rollback_startup_locked(record)
             raise
 
     async def kill(self, pid: int) -> ProcessRecord:
@@ -765,7 +765,7 @@ class ProcessRegistry:
         except IPCProtocolError as exc:
             return self._protocol_error(message, exc.code, str(exc))
         except Exception as exc:
-            code = "mailbox_full" if "full" in str(exc).lower() else "invalid_message"
+            code = "mailbox_full" if isinstance(exc, (asyncio.QueueFull, queue.Full)) else "invalid_message"
             return self._protocol_error(message, code, str(exc))
 
     def send_ipc_message(
@@ -989,6 +989,20 @@ class ProcessRegistry:
             with contextlib.suppress(Exception):
                 self.kernel.unregister_agent(record.name)
             record.resources_registered = False
+
+    async def _rollback_startup_locked(self, record: ProcessRecord) -> None:
+        """Remove any partial registrations created before startup committed."""
+        self._by_name.pop(record.name, None)
+        self._records.pop(record.pid, None)
+        self._message_stats.pop(record.pid, None)
+        self._unlink_child_locked(record)
+        with contextlib.suppress(Exception):
+            self.bus.unregister_mailbox(record.name)
+        with contextlib.suppress(Exception):
+            self.memory.unregister_agent(record.name)
+        with contextlib.suppress(Exception):
+            self.kernel.unregister_agent(record.name)
+        record.resources_registered = False
 
     async def _handle_terminal_process(self, record: ProcessRecord) -> None:
         abnormal = record.state is ProcessState.CRASHED
