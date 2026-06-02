@@ -184,7 +184,7 @@ impl NativeIPCBus {
         })
     }
 
-    pub fn recv_message(&self, py: Python<'_>, agent_name: String) -> PyResult<PyObject> {
+    pub fn recv_message(&self, py: Python<'_>, agent_name: String) -> PyResult<Py<PyAny>> {
         // Receiver ownership stays in Rust. Python receives only an asyncio.Future
         // that is completed from the runtime thread via call_soon_threadsafe.
         let receiver = {
@@ -193,7 +193,7 @@ impl NativeIPCBus {
         }
         .ok_or_else(|| PyKeyError::new_err(format!("unknown agent '{agent_name}'")))?;
 
-        let asyncio = py.import_bound("asyncio")?;
+        let asyncio = py.import("asyncio")?;
         let event_loop = asyncio.call_method0("get_running_loop")?.unbind();
         let future = event_loop
             .bind(py)
@@ -207,9 +207,9 @@ impl NativeIPCBus {
                 receiver.recv().await
             };
 
-            let _ = Python::with_gil(|py| match message {
+            let _ = Python::attach(|py| match message {
                 Some(message) => {
-                    let result = Py::new(py, message)?.into_py(py);
+                    let result = Py::new(py, message)?.into_any();
                     schedule_future_result(py, &event_loop, &future, result)
                 }
                 None => schedule_future_exception(
@@ -221,7 +221,7 @@ impl NativeIPCBus {
             });
         });
 
-        Ok(future_for_python.into_py(py))
+        Ok(future_for_python)
     }
 
     pub fn get_mailbox_metrics(&self) -> PyResult<Vec<(String, usize, usize, String)>> {
@@ -438,7 +438,7 @@ fn schedule_future_result(
     py: Python<'_>,
     event_loop: &Py<PyAny>,
     future: &Py<PyAny>,
-    result: PyObject,
+    result: Py<PyAny>,
 ) -> PyResult<()> {
     if future.bind(py).call_method0("cancelled")?.is_truthy()? {
         return Ok(());
@@ -464,7 +464,7 @@ fn schedule_future_exception(
 
     let callback = future.bind(py).getattr("set_exception")?;
     let exception = py
-        .get_type_bound::<PyRuntimeError>()
+        .get_type::<PyRuntimeError>()
         .call1((message,))?
         .unbind();
     event_loop

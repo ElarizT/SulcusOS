@@ -218,7 +218,7 @@ impl ContextMemoryManager {
             .collect())
     }
 
-    pub fn get_page_table_summary(&self, py: Python<'_>, agent_name: String) -> PyResult<PyObject> {
+    pub fn get_page_table_summary(&self, py: Python<'_>, agent_name: String) -> PyResult<Py<PyAny>> {
         let page_tables = self.page_tables.lock().map_err(lock_error)?;
         let page_table = page_tables
             .get(&agent_name)
@@ -231,7 +231,7 @@ impl ContextMemoryManager {
             .count();
         let paged_out_frames = page_table.pages.len() - active_frames;
 
-        let summary = PyDict::new_bound(py);
+        let summary = PyDict::new(py);
         summary.set_item("agent_name", &page_table.agent_name)?;
         summary.set_item("current_active_tokens", page_table.current_active_tokens)?;
         summary.set_item("max_active_tokens", page_table.max_active_tokens)?;
@@ -240,7 +240,7 @@ impl ContextMemoryManager {
         summary.set_item("total_frames", page_table.pages.len())?;
         summary.set_item("pending_evictions", page_table.pending_evictions.len())?;
 
-        Ok(summary.into_py(py))
+        Ok(summary.unbind().into_any())
     }
 
     pub fn list_agents(&self) -> PyResult<Vec<String>> {
