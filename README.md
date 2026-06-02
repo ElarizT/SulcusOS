@@ -37,7 +37,7 @@ For Windows test/development setup, see `docs/windows_dev_setup.md`.
 ### 1) Python environment
 
 ```powershell
-py -3.11 -m venv .venv
+py -3.14 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -U pip
 pip install -r requirements-dev.txt
