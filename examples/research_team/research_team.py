@@ -91,11 +91,23 @@ async def run_demo() -> dict[str, Any]:
         print("[SUPERVISOR] Workflow Complete")
         print(f"[SUPERVISOR] Final Score: {critic.review.score}/10")
         print("=" * 64)
+        hierarchy = {
+            "supervisor": "ResearchTeamSupervisor",
+            "children": [
+                "PlannerAgent",
+                "ResearchBenefitsAgent",
+                "ResearchRisksAgent",
+                "ResearchMarketAgent",
+                "SynthesizerAgent",
+                "CriticAgent",
+            ],
+        }
         return {
             "assignments": [agent.assignment_received for agent in research_agents],
             "research_results": dict(synthesizer.results),
             "synthesized_report": critic.report_received,
             "critic_review": critic.review,
+            "hierarchy": hierarchy,
             "research_agents": research_agents,
             "synthesizer": synthesizer,
             "critic": critic,

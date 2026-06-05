@@ -50,7 +50,7 @@ class AgentOSDashboard(App[None]):
         layout: grid;
         grid-size: 2 3;
         grid-columns: 1fr 1fr;
-        grid-rows: 2fr 1fr 1fr;
+        grid-rows: 2fr 1fr 3fr;
         height: 1fr;
     }
 
@@ -76,7 +76,12 @@ class AgentOSDashboard(App[None]):
     }
 
     #process-pane {
-        column-span: 2;
+        column-span: 1;
+        row-span: 1;
+    }
+
+    #agent-tree-pane {
+        column-span: 1;
         row-span: 1;
     }
 
@@ -101,6 +106,10 @@ class AgentOSDashboard(App[None]):
     }
 
     #process-table {
+        height: 1fr;
+    }
+
+    #agent-tree {
         height: 1fr;
     }
 
@@ -137,6 +146,7 @@ class AgentOSDashboard(App[None]):
         self._process_rows: list[dict[str, Any]] = []
         self._demo_mailboxes: list[MailboxMetric] | None = None
         self._demo_process_rows: list[dict[str, Any]] | None = None
+        self._demo_hierarchy: dict[str, Any] | None = None
         self._demo_status: str | None = None
         self._wasm_placeholder_logged = False
 
@@ -169,6 +179,13 @@ class AgentOSDashboard(App[None]):
             }
             for index, name in enumerate(names)
         ]
+        self._demo_hierarchy = state.get(
+            "hierarchy",
+            {
+                "supervisor": "ResearchTeamSupervisor",
+                "children": names,
+            },
+        )
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -183,6 +200,9 @@ class AgentOSDashboard(App[None]):
             with Vertical(id="wasm-pane", classes="pane"):
                 yield Static("WASM Execution Shield Matrix", classes="pane-title")
                 yield RichLog(id="wasm-log", markup=True, wrap=True, highlight=True)
+            with Vertical(id="agent-tree-pane", classes="pane"):
+                yield Static("Agent Tree View", classes="pane-title")
+                yield Static(id="agent-tree")
             with Vertical(id="process-pane", classes="pane"):
                 yield Static("Process Registry", classes="pane-title")
                 yield DataTable(id="process-table")
@@ -231,6 +251,7 @@ class AgentOSDashboard(App[None]):
         self._render_status(mailboxes)
         self._render_mailboxes(mailboxes)
         self._render_memory(memory_agents)
+        self._render_agent_tree()
         self._render_wasm_log(wasm_runs)
         self.run_worker(self._refresh_process_rows(), exclusive=True, group="process-refresh")
 
@@ -360,6 +381,25 @@ class AgentOSDashboard(App[None]):
                 f"{row.get('memory_hot_tokens', row.get('memory_tokens', 0))}/{row.get('memory_paged_count', 0)}",
                 f"{row.get('messages_sent', 0)}/{row.get('messages_received', 0)}/{row.get('message_errors', 0)}",
             )
+
+    def _render_agent_tree(self) -> None:
+        self.query_one("#agent-tree", Static).update(self._format_agent_tree(self._demo_hierarchy))
+
+    @staticmethod
+    def _format_agent_tree(hierarchy: dict[str, Any] | None) -> str:
+        if not hierarchy:
+            return "[dim]No active hierarchy[/]"
+
+        supervisor = str(hierarchy.get("supervisor", "")).strip()
+        children = [str(child) for child in hierarchy.get("children", [])]
+        if not supervisor:
+            return "[dim]No active hierarchy[/]"
+
+        lines = [f"[bold]{supervisor}[/]"]
+        for index, child in enumerate(children):
+            connector = "└──" if index == len(children) - 1 else "├──"
+            lines.append(f"{connector} {child}")
+        return "\n".join(lines)
 
     def _read_mailboxes(self) -> list[MailboxMetric]:
         if self._demo_mailboxes is not None:

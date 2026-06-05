@@ -15,6 +15,12 @@ def test_dashboard_uses_branded_shell_prompt() -> None:
     assert SHELL_PROMPT == "AgentOS>"
 
 
+def test_empty_dashboard_tree_shows_placeholder() -> None:
+    tree = AgentOSDashboard._format_agent_tree(None)
+
+    assert "No active hierarchy" in tree
+
+
 def test_planner_creates_expected_assignments() -> None:
     assignments = PlannerAgent().create_assignments()
 
@@ -125,3 +131,85 @@ async def test_dashboard_snapshot_shows_completed_research_team_workflow() -> No
         ("SynthesizerAgent", 1),
         ("CriticAgent", 1),
     ]
+
+
+@pytest.mark.asyncio
+async def test_research_team_demo_populates_dashboard_hierarchy() -> None:
+    state = await run_demo()
+    dashboard = AgentOSDashboard(
+        kernel=EmptyTelemetry(),
+        bus=EmptyTelemetry(),
+        memory=EmptyTelemetry(),
+        sandbox=EmptyTelemetry(),
+    )
+
+    dashboard.load_research_team_snapshot(state)
+
+    assert dashboard._demo_hierarchy == {
+        "supervisor": "ResearchTeamSupervisor",
+        "children": [
+            "PlannerAgent",
+            "ResearchBenefitsAgent",
+            "ResearchRisksAgent",
+            "ResearchMarketAgent",
+            "SynthesizerAgent",
+            "CriticAgent",
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_dashboard_tree_rendering_includes_expected_agent_names() -> None:
+    state = await run_demo()
+    dashboard = AgentOSDashboard(
+        kernel=EmptyTelemetry(),
+        bus=EmptyTelemetry(),
+        memory=EmptyTelemetry(),
+        sandbox=EmptyTelemetry(),
+    )
+
+    dashboard.load_research_team_snapshot(state)
+    tree = AgentOSDashboard._format_agent_tree(dashboard._demo_hierarchy)
+
+    for name in [
+        "ResearchTeamSupervisor",
+        "PlannerAgent",
+        "ResearchBenefitsAgent",
+        "ResearchRisksAgent",
+        "ResearchMarketAgent",
+        "SynthesizerAgent",
+        "CriticAgent",
+    ]:
+        assert name in tree
+
+
+@pytest.mark.asyncio
+async def test_dashboard_tree_panel_has_room_for_rendered_hierarchy() -> None:
+    state = await run_demo()
+    dashboard = AgentOSDashboard(
+        kernel=EmptyTelemetry(),
+        bus=EmptyTelemetry(),
+        memory=EmptyTelemetry(),
+        sandbox=EmptyTelemetry(),
+    )
+    dashboard.refresh_metrics = lambda: None  # type: ignore[method-assign]
+
+    async with dashboard.run_test(size=(120, 30)) as pilot:
+        dashboard.load_research_team_snapshot(state)
+        dashboard._render_agent_tree()
+        await pilot.pause(0)
+
+        tree = AgentOSDashboard._format_agent_tree(dashboard._demo_hierarchy)
+        tree_widget = dashboard.query_one("#agent-tree")
+
+        assert tree_widget.size.height >= len(tree.splitlines())
+        for name in [
+            "ResearchTeamSupervisor",
+            "PlannerAgent",
+            "ResearchBenefitsAgent",
+            "ResearchRisksAgent",
+            "ResearchMarketAgent",
+            "SynthesizerAgent",
+            "CriticAgent",
+        ]:
+            assert name in str(tree_widget.content)

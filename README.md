@@ -109,6 +109,10 @@ It demonstrates typed IPC contracts, planner fan-out, research fan-in,
 synthesis, and critic review without API keys or external services. See
 `examples/research_team/README.md` for the architecture and expected output.
 
+### Agent Tree View
+
+Visualizes supervisor-to-agent relationships for active workflows.
+
 ## Notes
 
 - Runtime behavior is configurable through environment variables used in `main.py`.
