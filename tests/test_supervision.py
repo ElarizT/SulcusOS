@@ -2,6 +2,7 @@ import asyncio
 
 import pytest
 
+from kernel.dashboard import AgentOSDashboard
 from kernel.process import ProcessRegistry
 from test_process_registry import FakeBus, FakeKernel, FakeMemory
 
@@ -203,6 +204,108 @@ async def test_parent_termination_cascades_to_children(tmp_path) -> None:
     assert registry._records[parent.pid].state.value == "killed"
     assert registry._records[child.pid].state.value == "killed"
     assert bus.mailboxes == {}
+
+
+@pytest.mark.asyncio
+async def test_killed_child_notifies_supervisor_and_restarts(tmp_path) -> None:
+    parent_path = tmp_path / "parent.py"
+    child_path = tmp_path / "child.py"
+    write_agent(parent_path, 'class Parent(AgentProcess):\n    name = "Parent"\n')
+    write_agent(child_path, 'class Child(AgentProcess):\n    name = "Child"\n')
+    registry = ProcessRegistry(kernel=FakeKernel(), bus=FakeBus(), memory=FakeMemory(), allowed_roots=[tmp_path])
+
+    parent = await registry.run_path(str(parent_path))
+    child = await registry.spawn_child(parent.pid, str(child_path))
+    await registry.kill(child.pid)
+
+    rows = await registry.list_processes()
+    child_row = next(row for row in rows if row["pid"] == child.pid)
+    replacement_row = next(row for row in rows if row["name"] == "Child" and row["status"] == "running")
+    parent_row = next(row for row in rows if row["pid"] == parent.pid)
+    events = registry.list_supervision_events()
+
+    assert child_row["status"] == "killed"
+    assert child_row["supervisor_pid"] == parent.pid
+    assert replacement_row["pid"] != child.pid
+    assert replacement_row["restart_count"] == 1
+    assert parent_row["child_count"] == 1
+    assert parent_row["child_pids"] == [replacement_row["pid"]]
+    assert parent_row["restart_count"] == 0
+    assert events == [
+        {
+            "event": "child_terminated",
+            "pid": child.pid,
+            "name": "Child",
+            "state": "killed",
+            "parent_pid": parent.pid,
+            "details": {},
+            "supervisor_pid": parent.pid,
+            "supervisor_name": "Parent",
+            "message": "Detected child termination:\nChild",
+        },
+        {
+            "event": "child_restart_requested",
+            "pid": child.pid,
+            "name": "Child",
+            "state": "killed",
+            "parent_pid": parent.pid,
+            "details": {},
+            "supervisor_pid": parent.pid,
+            "supervisor_name": "Parent",
+            "message": "Restarting child:\nChild",
+        },
+        {
+            "event": "child_restarted",
+            "pid": parent.pid,
+            "name": "Parent",
+            "state": "running",
+            "parent_pid": None,
+            "details": {
+                "old_pid": child.pid,
+                "new_pid": replacement_row["pid"],
+                "child_name": "Child",
+            },
+            "supervisor_pid": parent.pid,
+            "supervisor_name": "Parent",
+            "message": "Child restarted:\nChild",
+        },
+    ]
+    assert [record.name for record in registry._records.values()].count("Child") == 2
+
+
+@pytest.mark.asyncio
+async def test_dashboard_reflects_restarted_supervised_child(tmp_path) -> None:
+    parent_path = tmp_path / "parent.py"
+    child_path = tmp_path / "child.py"
+    write_agent(parent_path, 'class Parent(AgentProcess):\n    name = "Parent"\n')
+    write_agent(child_path, 'class Child(AgentProcess):\n    name = "Child"\n')
+    registry = ProcessRegistry(kernel=FakeKernel(), bus=FakeBus(), memory=FakeMemory(), allowed_roots=[tmp_path])
+    parent = await registry.run_path(str(parent_path))
+    child = await registry.spawn_child(parent.pid, str(child_path))
+    await registry.kill(child.pid)
+    rows = await registry.list_processes()
+
+    hierarchy = AgentOSDashboard._hierarchy_from_process_rows(rows)
+    tree = AgentOSDashboard._format_agent_tree(hierarchy)
+
+    assert hierarchy == {"supervisor": "Parent", "children": ["Child (restarted)"]}
+    assert AgentOSDashboard._display_process_status("killed") == "TERMINATED"
+    assert "Child (restarted)" in tree
+    assert "Child (terminated)" not in tree
+
+
+@pytest.mark.asyncio
+async def test_killed_unsupervised_process_does_not_restart(tmp_path) -> None:
+    child_path = tmp_path / "child.py"
+    write_agent(child_path, 'class Child(AgentProcess):\n    name = "Child"\n')
+    registry = ProcessRegistry(kernel=FakeKernel(), bus=FakeBus(), memory=FakeMemory(), allowed_roots=[tmp_path])
+
+    child = await registry.run_path(str(child_path))
+    await registry.kill(child.pid)
+
+    rows = await registry.list_processes()
+    assert [(row["pid"], row["status"]) for row in rows] == [(child.pid, "killed")]
+    assert registry.list_supervision_events() == []
 
 
 @pytest.mark.asyncio

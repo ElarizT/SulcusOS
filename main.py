@@ -657,6 +657,7 @@ async def main() -> None:
         sandbox=sandbox,
         command_handler=handle_shell_command,
         process_snapshot=process_registry.list_processes,
+        supervision_event_snapshot=process_registry.list_supervision_events,
     )
     if legacy_registry is not None:
         seed_boot_task(bus, legacy_registry)

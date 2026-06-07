@@ -132,6 +132,7 @@ class AgentOSDashboard(App[None]):
         sandbox: Any,
         command_handler: Callable[[str], Awaitable[str] | str] | None = None,
         process_snapshot: Callable[[], Awaitable[list[dict[str, Any]]] | list[dict[str, Any]]] | None = None,
+        supervision_event_snapshot: Callable[[], list[dict[str, Any]]] | None = None,
     ) -> None:
         super().__init__()
         self.kernel = kernel
@@ -140,9 +141,11 @@ class AgentOSDashboard(App[None]):
         self.sandbox = sandbox
         self.command_handler = command_handler
         self.process_snapshot = process_snapshot
+        self.supervision_event_snapshot = supervision_event_snapshot
         self._heartbeat_index = 0
         self._last_pending_evictions: dict[str, int] = {}
         self._logged_wasm_runs = 0
+        self._logged_supervision_events = 0
         self._process_rows: list[dict[str, Any]] = []
         self._demo_mailboxes: list[MailboxMetric] | None = None
         self._demo_process_rows: list[dict[str, Any]] | None = None
@@ -253,6 +256,7 @@ class AgentOSDashboard(App[None]):
         self._render_memory(memory_agents)
         self._render_agent_tree()
         self._render_wasm_log(wasm_runs)
+        self._render_supervision_events()
         self.run_worker(self._refresh_process_rows(), exclusive=True, group="process-refresh")
 
     async def _refresh_process_rows(self) -> None:
@@ -354,6 +358,21 @@ class AgentOSDashboard(App[None]):
             )
         self._logged_wasm_runs = len(runs)
 
+    def _render_supervision_events(self) -> None:
+        if self.supervision_event_snapshot is None:
+            return
+        events = self.supervision_event_snapshot()
+        log = self.query_one("#wasm-log", RichLog)
+        for event in events[self._logged_supervision_events :]:
+            style = {
+                "child_terminated": "bold red",
+                "child_restart_requested": "bold yellow",
+                "child_restarted": "bold green",
+            }.get(str(event.get("event")))
+            if style is not None:
+                log.write(Text(f"[Supervisor]\n{event.get('message', '')}", style=style))
+        self._logged_supervision_events = len(events)
+
     def _render_processes(self, rows: list[dict[str, Any]]) -> None:
         table = self.query_one("#process-table", DataTable)
         table.clear()
@@ -367,14 +386,15 @@ class AgentOSDashboard(App[None]):
                 "crashed": "bold red",
                 "exited": "dim",
             }.get(status, "white")
+            display_status = self._display_process_status(status)
             depth = int(row.get("tree_depth", 0))
             display_name = f"{'  ' * depth}{row.get('name', '')}"
             table.add_row(
                 str(row.get("pid", "")),
                 display_name,
-                Text(status, style=status_style),
+                Text(display_status, style=status_style),
                 str(row.get("execution_mode", "")),
-                "" if row.get("parent_pid") is None else str(row.get("parent_pid")),
+                "" if row.get("supervisor_pid") is None else str(row.get("supervisor_pid")),
                 str(row.get("child_count", 0)),
                 str(row.get("restart_count", 0)),
                 str(row.get("supervisor_strategy", "")),
@@ -382,8 +402,40 @@ class AgentOSDashboard(App[None]):
                 f"{row.get('messages_sent', 0)}/{row.get('messages_received', 0)}/{row.get('message_errors', 0)}",
             )
 
+    @staticmethod
+    def _display_process_status(status: str) -> str:
+        return "TERMINATED" if status == "killed" else status
+
     def _render_agent_tree(self) -> None:
-        self.query_one("#agent-tree", Static).update(self._format_agent_tree(self._demo_hierarchy))
+        hierarchy = self._demo_hierarchy or self._hierarchy_from_process_rows(self._process_rows)
+        self.query_one("#agent-tree", Static).update(self._format_agent_tree(hierarchy))
+
+    @staticmethod
+    def _hierarchy_from_process_rows(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+        by_pid = {row.get("pid"): row for row in rows}
+        supervised = [row for row in rows if row.get("supervisor_pid") in by_pid]
+        if not supervised:
+            return None
+        supervisor_pid = supervised[0]["supervisor_pid"]
+        supervisor = by_pid[supervisor_pid]
+        children_by_name: dict[str, dict[str, Any]] = {}
+        for row in supervised:
+            if row.get("supervisor_pid") != supervisor_pid:
+                continue
+            name = str(row.get("name", ""))
+            current = children_by_name.get(name)
+            if current is None or current.get("status") == "killed":
+                children_by_name[name] = row
+        children = []
+        for name, row in children_by_name.items():
+            if row.get("status") == "killed":
+                suffix = " (terminated)"
+            elif int(row.get("restart_count", 0)) > 0:
+                suffix = " (restarted)"
+            else:
+                suffix = ""
+            children.append(f"{name}{suffix}")
+        return {"supervisor": supervisor.get("name", ""), "children": children}
 
     @staticmethod
     def _format_agent_tree(hierarchy: dict[str, Any] | None) -> str:

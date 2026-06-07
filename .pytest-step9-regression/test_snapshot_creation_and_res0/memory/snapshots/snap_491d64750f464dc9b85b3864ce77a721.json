@@ -1,0 +1,29 @@
+{
+  "cold_refs": [],
+  "hot": [
+    {
+      "content": {
+        "note": "snapshot me"
+      },
+      "importance": 0.5,
+      "last_accessed": 1780844733.0743864,
+      "memory_id": "mem_f592e314e1fc4943b359287155b560ec",
+      "owner_pid": 100,
+      "process_name": "Agent",
+      "source": {},
+      "tags": [
+        "snap"
+      ],
+      "tier": "hot",
+      "timestamp": 1780844733.0743494,
+      "token_estimate": 4
+    }
+  ],
+  "pid": 100,
+  "process_name": "Agent",
+  "snapshot_id": "snap_491d64750f464dc9b85b3864ce77a721",
+  "timestamp": 1780844733.0744054,
+  "token_budget": 100,
+  "token_usage": 4,
+  "warm_refs": []
+}

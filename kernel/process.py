@@ -378,6 +378,7 @@ class ProcessRecord:
     resources_registered: bool = False
     error: str | None = None
     parent_pid: int | None = None
+    supervisor_pid: int | None = None
     child_pids: list[int] = field(default_factory=list)
     supervision_strategy: SupervisorStrategy = SupervisorStrategy.ONE_FOR_ONE
     restart_policy: RestartPolicy = RestartPolicy.PERMANENT
@@ -426,6 +427,7 @@ class ProcessRegistry:
         self._records: dict[int, ProcessRecord] = {}
         self._by_name: dict[str, int] = {}
         self._message_stats: dict[int, dict[str, int]] = {}
+        self._supervision_events: list[dict[str, Any]] = []
         self._lock = asyncio.Lock()
 
     async def run_path(self, raw_path: str) -> ProcessRecord:
@@ -497,6 +499,7 @@ class ProcessRegistry:
                 mailbox_size=mailbox_size,
                 execution_mode=ExecutionMode.IN_PROCESS,
                 parent_pid=parent_pid,
+                supervisor_pid=parent_pid,
                 restart_policy=restart_policy,
                 supervision_strategy=self._normalize_supervisor_strategy(
                     getattr(process, "supervisor_strategy", SupervisorStrategy.ONE_FOR_ONE.value)
@@ -585,6 +588,7 @@ class ProcessRegistry:
             child_inbox=child_inbox,
             child_outbox=child_outbox,
             parent_pid=parent_pid,
+            supervisor_pid=parent_pid,
             restart_policy=restart_policy,
         )
 
@@ -654,7 +658,8 @@ class ProcessRegistry:
                 await self._rollback_startup_locked(record)
             raise
 
-    async def kill(self, pid: int) -> ProcessRecord:
+    async def kill(self, pid: int, *, auto_restart: bool = True) -> ProcessRecord:
+        supervisor: ProcessRecord | None = None
         async with self._lock:
             record = self._records.get(pid)
             if record is None:
@@ -670,7 +675,7 @@ class ProcessRegistry:
 
         for child_pid in child_pids:
             with contextlib.suppress(KeyError, RuntimeError):
-                await self.kill(child_pid)
+                await self.kill(child_pid, auto_restart=False)
 
         if record.execution_mode is ExecutionMode.ISOLATED:
             with contextlib.suppress(Exception):
@@ -693,14 +698,42 @@ class ProcessRegistry:
             record.state = ProcessState.KILLED
             await self._cleanup_locked(record)
             record.child_pids.clear()
+            if record.parent_pid is not None:
+                self._emit_supervision_event_locked("child_terminated", record)
+                supervisor = self._records.get(record.parent_pid)
+                if (
+                    auto_restart
+                    and supervisor is not None
+                    and supervisor.state in {ProcessState.STARTING, ProcessState.RUNNING}
+                ):
+                    self._emit_supervision_event_locked("child_restart_requested", record)
+            if (
+                not auto_restart
+                or supervisor is None
+                or supervisor.state not in {ProcessState.STARTING, ProcessState.RUNNING}
+            ):
+                self._unlink_child_locked(record)
+                return record
+
+        replacement = await self._restart_child(supervisor, record)
+        if replacement.execution_mode is ExecutionMode.IN_PROCESS:
+            await asyncio.sleep(0)
+        async with self._lock:
             self._unlink_child_locked(record)
-            self._emit_supervision_event_locked("process_stopped", record)
-            return record
+            self._emit_supervision_event_locked(
+                "child_restarted",
+                supervisor,
+                details={"old_pid": record.pid, "new_pid": replacement.pid, "child_name": replacement.name},
+            )
+        return record
 
     async def list_processes(self) -> list[dict[str, Any]]:
         await self._reap_finished_children()
         async with self._lock:
             return [self._snapshot(record) for record in sorted(self._records.values(), key=lambda item: item.pid)]
+
+    def list_supervision_events(self) -> list[dict[str, Any]]:
+        return [dict(event) for event in self._supervision_events]
 
     async def spawn_child(
         self,
@@ -744,6 +777,7 @@ class ProcessRegistry:
         if child is None:
             raise KeyError(f"unknown child PID {child_pid}")
         child.parent_pid = parent_pid
+        child.supervisor_pid = parent_pid
         if child_pid not in parent.child_pids:
             parent.child_pids.append(child_pid)
 
@@ -1095,7 +1129,7 @@ class ProcessRegistry:
                     break
             if child.state in {ProcessState.STARTING, ProcessState.RUNNING, ProcessState.STOPPING}:
                 with contextlib.suppress(KeyError, RuntimeError):
-                    await self.kill(child.pid)
+                    await self.kill(child.pid, auto_restart=False)
             async with self._lock:
                 current_parent = self._records.get(parent.pid)
                 if current_parent is None or current_parent.state not in {ProcessState.STARTING, ProcessState.RUNNING}:
@@ -1127,7 +1161,7 @@ class ProcessRegistry:
     async def _terminate_children_of_terminal_parent(self, record: ProcessRecord) -> None:
         for child_pid in list(record.child_pids):
             with contextlib.suppress(KeyError, RuntimeError):
-                await self.kill(child_pid)
+                await self.kill(child_pid, auto_restart=False)
         async with self._lock:
             for child_pid in list(record.child_pids):
                 child = self._records.get(child_pid)
@@ -1256,6 +1290,7 @@ class ProcessRegistry:
         if parent is None or child is None:
             return
         child.parent_pid = parent_pid
+        child.supervisor_pid = parent_pid
         if child_pid not in parent.child_pids:
             parent.child_pids.append(child_pid)
 
@@ -1299,6 +1334,20 @@ class ProcessRegistry:
             "parent_pid": record.parent_pid,
             "details": details or {},
         }
+        messages = {
+            "child_terminated": f"Detected child termination:\n{record.name}",
+            "child_restart_requested": f"Restarting child:\n{record.name}",
+            "child_restarted": f"Child restarted:\n{(details or {}).get('child_name', record.name)}",
+        }
+        if event_name in messages:
+            self._supervision_events.append(
+                {
+                    **payload,
+                    "supervisor_pid": parent.pid,
+                    "supervisor_name": parent.name,
+                    "message": messages[event_name],
+                }
+            )
         try:
             message = EventMessage(
                 source_pid=record.pid,
@@ -1351,6 +1400,7 @@ class ProcessRegistry:
             "messages_received": stats.get("received", 0),
             "message_errors": stats.get("errors", 0),
             "parent_pid": record.parent_pid,
+            "supervisor_pid": record.supervisor_pid,
             "child_count": len(record.child_pids),
             "child_pids": list(record.child_pids),
             "tree_depth": self._tree_depth(record),

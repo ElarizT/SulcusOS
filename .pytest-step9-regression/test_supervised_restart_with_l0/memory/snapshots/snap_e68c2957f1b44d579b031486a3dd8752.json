@@ -1,0 +1,29 @@
+{
+  "cold_refs": [],
+  "hot": [
+    {
+      "content": {
+        "note": "restore me"
+      },
+      "importance": 0.5,
+      "last_accessed": 1780844733.1655204,
+      "memory_id": "mem_d948489079654a959882a0494c944d82",
+      "owner_pid": 101,
+      "process_name": "Child",
+      "source": {},
+      "tags": [
+        "restore"
+      ],
+      "tier": "hot",
+      "timestamp": 1780844733.1654592,
+      "token_estimate": 4
+    }
+  ],
+  "pid": 101,
+  "process_name": "Child",
+  "snapshot_id": "snap_e68c2957f1b44d579b031486a3dd8752",
+  "timestamp": 1780844733.1655793,
+  "token_budget": 8000,
+  "token_usage": 4,
+  "warm_refs": []
+}
