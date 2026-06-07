@@ -1,5 +1,9 @@
 # Agent OS Core
 
+<p align="center">
+  <img src="docs/AgentOS_demo.gif" width="900">
+</p>
+
 A lightweight hybrid runtime that combines:
 
 - A Rust core crate (`agent_os_core`)
