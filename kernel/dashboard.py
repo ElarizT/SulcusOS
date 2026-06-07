@@ -151,12 +151,14 @@ class AgentOSDashboard(App[None]):
         self._demo_process_rows: list[dict[str, Any]] | None = None
         self._demo_hierarchy: dict[str, Any] | None = None
         self._demo_supervision_events: list[dict[str, Any]] | None = None
+        self._demo_page_tables: list[dict[str, Any]] | None = None
         self._demo_status: str | None = None
         self._wasm_placeholder_logged = False
 
     def load_research_team_snapshot(self, state: dict[str, Any]) -> None:
         self._logged_supervision_events = 0
         self._demo_supervision_events = None
+        self._demo_page_tables = None
         review = state["critic_review"]
         self._demo_status = f"Workflow Complete  Final Score: {review.score}/10"
         self._demo_mailboxes = [
@@ -195,6 +197,7 @@ class AgentOSDashboard(App[None]):
 
     def load_supervisor_recovery_snapshot(self, state: dict[str, Any]) -> None:
         self._logged_supervision_events = 0
+        self._demo_page_tables = None
         self._demo_status = str(state["status"])
         self._demo_mailboxes = [
             MailboxMetric("RecoverySupervisor", 3, 3, "Supervisor Events"),
@@ -202,6 +205,18 @@ class AgentOSDashboard(App[None]):
         ]
         self._demo_process_rows = list(state["process_rows"])
         self._demo_hierarchy = dict(state["hierarchy"])
+        self._demo_supervision_events = list(state["events"])
+
+    def load_memory_paging_snapshot(self, state: dict[str, Any]) -> None:
+        self._logged_supervision_events = 0
+        self._demo_status = str(state["status"])
+        self._demo_mailboxes = [
+            MailboxMetric("AgentA", 0, 1, "Context Loaded"),
+            MailboxMetric("AgentB", 0, 1, "Context Loaded"),
+        ]
+        self._demo_process_rows = list(state["process_rows"])
+        self._demo_hierarchy = dict(state["hierarchy"])
+        self._demo_page_tables = list(state["page_tables"])
         self._demo_supervision_events = list(state["events"])
 
     def compose(self) -> ComposeResult:
@@ -327,6 +342,10 @@ class AgentOSDashboard(App[None]):
             )
 
     def _render_memory(self, agents: list[str]) -> None:
+        if self._demo_page_tables is not None:
+            self.query_one("#memory-bars", Static).update(self._format_demo_page_tables(self._demo_page_tables))
+            return
+
         lines: list[str] = []
 
         if not agents:
@@ -355,6 +374,18 @@ class AgentOSDashboard(App[None]):
             )
 
         self.query_one("#memory-bars", Static).update("\n".join(lines))
+
+    @staticmethod
+    def _format_demo_page_tables(page_tables: list[dict[str, Any]]) -> str:
+        lines: list[str] = []
+        for table in page_tables:
+            lines.append(f"[bold]{table['agent']}[/]")
+            for page in table["pages"]:
+                state = str(page["state"])
+                style = "bold red" if state == "evicted" else "green"
+                label = "Evicted" if state == "evicted" else "Active"
+                lines.append(f"  [{style}]Page {page['page']}  {label}[/]")
+        return "\n".join(lines)
 
     def _render_wasm_log(self, runs: list[WasmRunMetric]) -> None:
         log = self.query_one("#wasm-log", RichLog)
@@ -385,9 +416,15 @@ class AgentOSDashboard(App[None]):
                 "child_terminated": "bold red",
                 "child_restart_requested": "bold yellow",
                 "child_restarted": "bold green",
+                "page_allocated": "bold green",
+                "page_evicted": "bold red",
             }.get(str(event.get("event")))
             if style is not None:
-                log.write(Text(f"[Supervisor]\n{event.get('message', '')}", style=style))
+                if str(event.get("event", "")).startswith("page_"):
+                    message = f"[Memory] {event.get('message', '')}"
+                else:
+                    message = f"[Supervisor]\n{event.get('message', '')}"
+                log.write(Text(message, style=style))
         self._logged_supervision_events = len(events)
 
     def _render_processes(self, rows: list[dict[str, Any]]) -> None:

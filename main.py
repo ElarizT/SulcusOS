@@ -26,6 +26,7 @@ from kernel.shell_help import (
     DEMO_COMMANDS,
     format_demo_browser,
     format_shell_help,
+    is_memory_paging_demo_path,
     is_supervisor_recovery_demo_path,
 )
 
@@ -620,6 +621,11 @@ async def main() -> None:
 
                 app.load_supervisor_recovery_snapshot(build_demo_snapshot())
                 return "Supervisor Recovery demo loaded: Recovery Complete"
+            if is_memory_paging_demo_path(argument):
+                from demos.memory_paging import build_demo_snapshot
+
+                app.load_memory_paging_snapshot(build_demo_snapshot())
+                return "Memory Paging demo loaded: Memory Demo Complete"
             record = await process_registry.run_path(argument)
             return f"started PID {record.pid} ({record.name}) from {record.path}"
 

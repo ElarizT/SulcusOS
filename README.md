@@ -6,6 +6,32 @@ A lightweight hybrid runtime that combines:
 - Python orchestration (`main.py`, `kernel/`)
 - Optional WASM sandboxed execution for constrained agent code
 
+## Try the demos
+
+Launch the interactive Agent OS dashboard:
+
+```powershell
+python main.py
+```
+
+Then use the dashboard shell:
+
+```text
+AgentOS> demos
+AgentOS> run examples/research_team
+AgentOS> run demos/supervisor_recovery
+AgentOS> run demos/memory_paging
+```
+
+| Demo | Command | Demonstrates |
+|---|---|---|
+| Research Team | `run examples/research_team` | Multi-agent workflow orchestration, IPC flow, and agent hierarchy visualization |
+| Supervisor Recovery | `run demos/supervisor_recovery` | Child termination detection, supervisor restart, and fault tolerance |
+| Memory Paging | `run demos/memory_paging` | Context/page allocation visualization |
+
+The dashboard visualizes the Agent Tree View, IPC Mailbox Lane Monitor,
+Process Registry, workflow or recovery status, and WASM isolation status.
+
 ## Project Structure
 
 - `src/` Rust crate source
