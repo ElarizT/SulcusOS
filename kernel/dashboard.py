@@ -12,6 +12,7 @@ from textual.containers import Container, Vertical
 from textual.widgets import DataTable, Footer, Header, Input, RichLog, Static
 
 from kernel.events import RuntimeEvent, render_runtime_event
+from kernel.ipc_inspector import build_ipc_snapshot, render_ipc_inspector
 from kernel.metrics import build_agent_metrics_snapshot, render_agent_metrics
 from kernel.timeline import render_runtime_timeline
 
@@ -131,6 +132,11 @@ class AgentOSDashboard(App[None]):
         overflow: auto;
     }
 
+    #ipc-inspector {
+        height: 1fr;
+        overflow: auto;
+    }
+
     #shell-input {
         dock: bottom;
         height: 3;
@@ -172,18 +178,34 @@ class AgentOSDashboard(App[None]):
         self._demo_supervision_events: list[dict[str, Any] | RuntimeEvent] | None = None
         self._runtime_events: list[RuntimeEvent] = []
         self._demo_page_tables: list[dict[str, Any]] | None = None
+        self._demo_ipc_records: list[Any] | None = None
         self._demo_status: str | None = None
         self._mailbox_signature: tuple[tuple[str, int, int, str], ...] | None = None
         self._process_signature: tuple[tuple[Any, ...], ...] | None = None
         self._scrollable_content: dict[str, str] = {}
         self._timeline_signature: tuple[str, ...] | None = None
         self._metrics_signature: tuple[str, ...] | None = None
+        self._ipc_inspector_signature: tuple[str, ...] | None = None
         self._wasm_placeholder_logged = False
 
     def load_research_team_snapshot(self, state: dict[str, Any]) -> None:
         self._logged_supervision_events = 0
         self._demo_supervision_events = None
         self._demo_page_tables = None
+        assignments = state.get("assignments", ())
+        research_agents = state.get("research_agents", ())
+        self._demo_ipc_records = [
+            {"sender": "PlannerAgent", "receiver": assignment.destination, "message_type": "assignment"}
+            for assignment in assignments
+        ]
+        self._demo_ipc_records.extend(
+            {"sender": agent.name, "receiver": "SynthesizerAgent", "message_type": "result"}
+            for agent in research_agents
+        )
+        if state.get("synthesized_report") is not None:
+            self._demo_ipc_records.append(
+                {"sender": "SynthesizerAgent", "receiver": "CriticAgent", "message_type": "report"}
+            )
         review = state["critic_review"]
         self._demo_status = f"Workflow Complete  Final Score: {review.score}/10"
         self._demo_mailboxes = [
@@ -223,6 +245,7 @@ class AgentOSDashboard(App[None]):
     def load_supervisor_recovery_snapshot(self, state: dict[str, Any]) -> None:
         self._logged_supervision_events = 0
         self._demo_page_tables = None
+        self._demo_ipc_records = None
         self._demo_status = str(state["status"])
         self._demo_mailboxes = [
             MailboxMetric("RecoverySupervisor", 3, 3, "Supervisor Events"),
@@ -234,6 +257,7 @@ class AgentOSDashboard(App[None]):
 
     def load_memory_paging_snapshot(self, state: dict[str, Any]) -> None:
         self._logged_supervision_events = 0
+        self._demo_ipc_records = None
         self._demo_status = str(state["status"])
         self._demo_mailboxes = [
             MailboxMetric("AgentA", 0, 1, "Context Loaded"),
@@ -253,6 +277,7 @@ class AgentOSDashboard(App[None]):
         self._demo_hierarchy = None
         self._demo_supervision_events = None
         self._demo_page_tables = None
+        self._demo_ipc_records = None
         self._demo_status = "External Agent Complete" if succeeded else "External Agent Failed"
         self._runtime_events.extend(events)
 
@@ -268,6 +293,8 @@ class AgentOSDashboard(App[None]):
             with Vertical(id="memory-pane", classes="pane"):
                 yield Static("Page Table Context Visualizer", classes="pane-title")
                 yield Static(id="memory-bars")
+                yield Static("IPC Inspector", id="ipc-inspector-title", classes="pane-title")
+                yield Static(id="ipc-inspector")
             with Vertical(id="wasm-pane", classes="pane"):
                 yield Static("Execution / WASM Isolation Monitor", classes="pane-title")
                 yield RichLog(id="wasm-log", markup=True, wrap=True, highlight=True, auto_scroll=False)
@@ -325,6 +352,7 @@ class AgentOSDashboard(App[None]):
 
         self._render_status(mailboxes)
         self._render_mailboxes(mailboxes)
+        self._render_ipc_inspector(mailboxes)
         self._render_memory(memory_agents)
         self._render_agent_tree()
         self._render_wasm_log(wasm_runs)
@@ -525,6 +553,27 @@ class AgentOSDashboard(App[None]):
         self._metrics_signature = signature
         content = "\n".join(rows) if rows else "[dim]No agent metrics available yet.[/]"
         self._update_scrollable_static_follow_end("#agent-metrics", content)
+
+    def _render_ipc_inspector(self, mailboxes: list[MailboxMetric] | None = None) -> None:
+        records: list[Any] = list(self._demo_ipc_records or ())
+        records.extend(
+            event
+            for event in self._runtime_events
+            if ("sender" in event.metadata or "source" in event.metadata)
+            and ("receiver" in event.metadata or "target" in event.metadata)
+        )
+        snapshot = build_ipc_snapshot(
+            records,
+            process_rows=self._process_rows,
+            mailbox_metrics=mailboxes or self._read_mailboxes(),
+        )
+        rows = render_ipc_inspector(snapshot)
+        signature = tuple(rows)
+        if signature == self._ipc_inspector_signature:
+            return
+        self._ipc_inspector_signature = signature
+        content = "\n".join(rows) if rows else "[dim]No IPC activity yet.[/]"
+        self._update_scrollable_static_follow_end("#ipc-inspector", content)
 
     def _render_processes(self, rows: list[dict[str, Any]]) -> None:
         signature = tuple(

@@ -191,3 +191,7 @@ events, with compact lifecycle and metadata summaries.
 
 Step 20 added an Agent Metrics Panel for compact per-agent runtime health and
 activity inspection, building on structured runtime events and the runtime timeline.
+
+### IPC inspector
+
+Step 21 adds an IPC Inspector for visualizing communication between agents.
