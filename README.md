@@ -181,3 +181,13 @@ Visualizes supervisor-to-agent relationships for active workflows.
 
 Agent OS emits structured runtime events for dashboard observability. These
 events power future filtering, metrics, replay, and debugging features.
+
+### Runtime timeline
+
+The dashboard includes a chronological Runtime Timeline view for structured
+events, with compact lifecycle and metadata summaries.
+
+### Agent metrics
+
+Step 20 added an Agent Metrics Panel for compact per-agent runtime health and
+activity inspection, building on structured runtime events and the runtime timeline.

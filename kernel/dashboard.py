@@ -12,6 +12,8 @@ from textual.containers import Container, Vertical
 from textual.widgets import DataTable, Footer, Header, Input, RichLog, Static
 
 from kernel.events import RuntimeEvent, render_runtime_event
+from kernel.metrics import build_agent_metrics_snapshot, render_agent_metrics
+from kernel.timeline import render_runtime_timeline
 
 SHELL_PROMPT = "AgentOS>"
 
@@ -119,6 +121,16 @@ class AgentOSDashboard(App[None]):
         overflow: auto;
     }
 
+    #runtime-timeline {
+        height: 1fr;
+        overflow: auto;
+    }
+
+    #agent-metrics {
+        height: 1fr;
+        overflow: auto;
+    }
+
     #shell-input {
         dock: bottom;
         height: 3;
@@ -164,6 +176,8 @@ class AgentOSDashboard(App[None]):
         self._mailbox_signature: tuple[tuple[str, int, int, str], ...] | None = None
         self._process_signature: tuple[tuple[Any, ...], ...] | None = None
         self._scrollable_content: dict[str, str] = {}
+        self._timeline_signature: tuple[str, ...] | None = None
+        self._metrics_signature: tuple[str, ...] | None = None
         self._wasm_placeholder_logged = False
 
     def load_research_team_snapshot(self, state: dict[str, Any]) -> None:
@@ -249,6 +263,8 @@ class AgentOSDashboard(App[None]):
             with Vertical(id="ipc-pane", classes="pane"):
                 yield Static("IPC Mailbox Lane Monitor", classes="pane-title")
                 yield DataTable(id="ipc-table")
+                yield Static("Agent Metrics", id="metrics-title", classes="pane-title")
+                yield Static(id="agent-metrics")
             with Vertical(id="memory-pane", classes="pane"):
                 yield Static("Page Table Context Visualizer", classes="pane-title")
                 yield Static(id="memory-bars")
@@ -261,6 +277,8 @@ class AgentOSDashboard(App[None]):
             with Vertical(id="process-pane", classes="pane"):
                 yield Static("Process Registry", classes="pane-title")
                 yield DataTable(id="process-table")
+                yield Static("Runtime Timeline", id="timeline-title", classes="pane-title")
+                yield Static(id="runtime-timeline")
         yield Input(
             placeholder=f"{SHELL_PROMPT} run <path> | inspect <path> | demos | ps | kill <PID>",
             id="shell-input",
@@ -312,16 +330,19 @@ class AgentOSDashboard(App[None]):
         self._render_wasm_log(wasm_runs)
         self._render_supervision_events()
         self._render_runtime_events()
+        self._render_timeline()
         self.run_worker(self._refresh_process_rows(), exclusive=True, group="process-refresh")
 
     async def _refresh_process_rows(self) -> None:
         if self._demo_process_rows is not None:
             self._process_rows = self._demo_process_rows
             self._render_processes(self._process_rows)
+            self._render_agent_metrics()
             return
         if self.process_snapshot is None:
             self._process_rows = []
             self._render_processes([])
+            self._render_agent_metrics()
             return
         try:
             rows = self.process_snapshot()
@@ -331,6 +352,7 @@ class AgentOSDashboard(App[None]):
         except Exception:
             self._process_rows = []
         self._render_processes(self._process_rows)
+        self._render_agent_metrics()
 
     def _render_status(self, mailboxes: list[MailboxMetric]) -> None:
         heartbeats = ["|", "/", "-", "\\"]
@@ -474,6 +496,36 @@ class AgentOSDashboard(App[None]):
             self._write_execution_log(event, scroll_end=False)
         self._logged_runtime_events = len(self._runtime_events)
 
+    def _render_timeline(self) -> None:
+        events: list[Any] = []
+        if self._demo_supervision_events is not None:
+            events.extend(self._demo_supervision_events)
+        elif self.supervision_event_snapshot is not None:
+            events.extend(self.supervision_event_snapshot())
+        events.extend(self._runtime_events)
+
+        rows = render_runtime_timeline(events)
+        signature = tuple(rows)
+        if signature == self._timeline_signature:
+            return
+        self._timeline_signature = signature
+        content = "\n".join(rows) if rows else "[dim]No runtime events yet.[/]"
+        self._update_scrollable_static_follow_end("#runtime-timeline", content)
+
+    def _render_agent_metrics(self) -> None:
+        events: list[Any] = []
+        if self._demo_supervision_events is not None:
+            events.extend(self._demo_supervision_events)
+        events.extend(self._runtime_events)
+        snapshot = build_agent_metrics_snapshot(self._process_rows, events)
+        rows = render_agent_metrics(snapshot)
+        signature = tuple(rows)
+        if signature == self._metrics_signature:
+            return
+        self._metrics_signature = signature
+        content = "\n".join(rows) if rows else "[dim]No agent metrics available yet.[/]"
+        self._update_scrollable_static_follow_end("#agent-metrics", content)
+
     def _render_processes(self, rows: list[dict[str, Any]]) -> None:
         signature = tuple(
             (
@@ -543,6 +595,18 @@ class AgentOSDashboard(App[None]):
         widget = self.query_one(selector, Static)
         with self._preserve_scroll(widget):
             widget.update(content)
+
+    def _update_scrollable_static_follow_end(self, selector: str, content: str) -> None:
+        if self._scrollable_content.get(selector) == content:
+            return
+        widget = self.query_one(selector, Static)
+        was_at_end = widget.is_vertical_scroll_end
+        if was_at_end:
+            self._scrollable_content[selector] = content
+            widget.update(content)
+            widget.scroll_end(animate=False)
+            return
+        self._update_scrollable_static(selector, content)
 
     def _write_execution_log(self, content: Any, *, scroll_end: bool | None = None) -> None:
         log = self.query_one("#wasm-log", RichLog)
