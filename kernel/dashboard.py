@@ -11,6 +11,8 @@ from textual.app import App, ComposeResult
 from textual.containers import Container, Vertical
 from textual.widgets import DataTable, Footer, Header, Input, RichLog, Static
 
+from kernel.events import RuntimeEvent, render_runtime_event
+
 SHELL_PROMPT = "AgentOS>"
 
 
@@ -150,11 +152,13 @@ class AgentOSDashboard(App[None]):
         self._last_pending_evictions: dict[str, int] = {}
         self._logged_wasm_runs = 0
         self._logged_supervision_events = 0
+        self._logged_runtime_events = 0
         self._process_rows: list[dict[str, Any]] = []
         self._demo_mailboxes: list[MailboxMetric] | None = None
         self._demo_process_rows: list[dict[str, Any]] | None = None
         self._demo_hierarchy: dict[str, Any] | None = None
-        self._demo_supervision_events: list[dict[str, Any]] | None = None
+        self._demo_supervision_events: list[dict[str, Any] | RuntimeEvent] | None = None
+        self._runtime_events: list[RuntimeEvent] = []
         self._demo_page_tables: list[dict[str, Any]] | None = None
         self._demo_status: str | None = None
         self._mailbox_signature: tuple[tuple[str, int, int, str], ...] | None = None
@@ -226,7 +230,9 @@ class AgentOSDashboard(App[None]):
         self._demo_page_tables = list(state["page_tables"])
         self._demo_supervision_events = list(state["events"])
 
-    def load_external_agent_result(self, *, succeeded: bool) -> None:
+    def load_external_agent_result(
+        self, *, succeeded: bool, events: list[RuntimeEvent] | tuple[RuntimeEvent, ...] = ()
+    ) -> None:
         """Return dashboard panels to live state and show external run status."""
         self._demo_mailboxes = None
         self._demo_process_rows = None
@@ -234,6 +240,7 @@ class AgentOSDashboard(App[None]):
         self._demo_supervision_events = None
         self._demo_page_tables = None
         self._demo_status = "External Agent Complete" if succeeded else "External Agent Failed"
+        self._runtime_events.extend(events)
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -304,6 +311,7 @@ class AgentOSDashboard(App[None]):
         self._render_agent_tree()
         self._render_wasm_log(wasm_runs)
         self._render_supervision_events()
+        self._render_runtime_events()
         self.run_worker(self._refresh_process_rows(), exclusive=True, group="process-refresh")
 
     async def _refresh_process_rows(self) -> None:
@@ -443,6 +451,9 @@ class AgentOSDashboard(App[None]):
         else:
             return
         for event in events[self._logged_supervision_events :]:
+            if isinstance(event, RuntimeEvent):
+                self._write_execution_log(event, scroll_end=False)
+                continue
             style = {
                 "child_terminated": "bold red",
                 "child_restart_requested": "bold yellow",
@@ -457,6 +468,11 @@ class AgentOSDashboard(App[None]):
                     message = f"[Supervisor]\n{event.get('message', '')}"
                 self._write_execution_log(Text(message, style=style), scroll_end=False)
         self._logged_supervision_events = len(events)
+
+    def _render_runtime_events(self) -> None:
+        for event in self._runtime_events[self._logged_runtime_events :]:
+            self._write_execution_log(event, scroll_end=False)
+        self._logged_runtime_events = len(self._runtime_events)
 
     def _render_processes(self, rows: list[dict[str, Any]]) -> None:
         signature = tuple(
@@ -530,6 +546,8 @@ class AgentOSDashboard(App[None]):
 
     def _write_execution_log(self, content: Any, *, scroll_end: bool | None = None) -> None:
         log = self.query_one("#wasm-log", RichLog)
+        if isinstance(content, RuntimeEvent):
+            content = render_runtime_event(content)
         if scroll_end is None:
             scroll_end = log.is_vertical_scroll_end
         log.write(content, scroll_end=scroll_end)

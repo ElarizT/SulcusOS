@@ -54,6 +54,11 @@ async def test_valid_external_basic_agent_runs_and_records_completion() -> None:
     assert rows[0]["name"] == "external_basic_agent"
     assert rows[0]["status"] == "exited"
     assert rows[0]["external"] is True
+    assert [event.event_type for event in result.events] == [
+        "external_agent_loaded",
+        "external_agent_started",
+        "external_agent_completed",
+    ]
 
     shell_output = format_external_agent_run(result)
     assert "External agent loaded:" in shell_output
@@ -103,6 +108,11 @@ async def test_external_agent_runtime_exception_is_captured(tmp_path) -> None:
     assert result.error == "startup boom"
     assert "[FailingExternalAgent] Started" in result.output
     assert rows[0]["status"] == "crashed"
+    assert [event.event_type for event in result.events] == [
+        "external_agent_loaded",
+        "external_agent_started",
+        "external_agent_failed",
+    ]
     assert "startup boom" in format_external_agent_run(result)
 
 

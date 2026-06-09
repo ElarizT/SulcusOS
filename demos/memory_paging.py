@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from kernel.events import RuntimeEvent
+
 
 def build_demo_snapshot() -> dict[str, Any]:
     supervisor_pid = 300
@@ -69,10 +71,20 @@ def build_demo_snapshot() -> dict[str, Any]:
             },
         ],
         "events": [
-            {"event": "page_allocated", "message": "Allocated Page 0"},
-            {"event": "page_allocated", "message": "Allocated Page 1"},
-            {"event": "page_allocated", "message": "Allocated Page 2"},
-            {"event": "page_evicted", "message": "Evicted Page 1"},
-            {"event": "page_allocated", "message": "Allocated Page 3"},
+            RuntimeEvent.info(
+                "MemorySupervisor", "page_allocated", "Allocated Page 0", {"page": 0, "agent": "AgentA"}
+            ),
+            RuntimeEvent.info(
+                "MemorySupervisor", "page_allocated", "Allocated Page 1", {"page": 1, "agent": "AgentA"}
+            ),
+            RuntimeEvent.info(
+                "MemorySupervisor", "page_allocated", "Allocated Page 2", {"page": 2, "agent": "AgentB"}
+            ),
+            RuntimeEvent.warning(
+                "MemorySupervisor", "page_evicted", "Evicted Page 1", {"page": 1, "agent": "AgentA"}
+            ),
+            RuntimeEvent.info(
+                "MemorySupervisor", "page_allocated", "Allocated Page 3", {"page": 3, "agent": "AgentB"}
+            ),
         ],
     }

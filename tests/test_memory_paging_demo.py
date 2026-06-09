@@ -4,6 +4,7 @@ import pytest
 
 from demos.memory_paging import build_demo_snapshot
 from kernel.dashboard import AgentOSDashboard
+from kernel.events import RuntimeEvent
 from kernel.shell_help import MEMORY_PAGING_DEMO_PATH, format_demo_browser, is_memory_paging_demo_path
 from textual.widgets import RichLog, Static
 
@@ -67,12 +68,20 @@ def test_memory_paging_event_log_contains_allocation_and_eviction_sequence() -> 
     dashboard = make_dashboard()
     dashboard.load_memory_paging_snapshot(build_demo_snapshot())
 
-    assert [event["message"] for event in dashboard._demo_supervision_events] == [
+    assert all(isinstance(event, RuntimeEvent) for event in dashboard._demo_supervision_events)
+    assert [event.message for event in dashboard._demo_supervision_events] == [
         "Allocated Page 0",
         "Allocated Page 1",
         "Allocated Page 2",
         "Evicted Page 1",
         "Allocated Page 3",
+    ]
+    assert [event.event_type for event in dashboard._demo_supervision_events] == [
+        "page_allocated",
+        "page_allocated",
+        "page_allocated",
+        "page_evicted",
+        "page_allocated",
     ]
 
 

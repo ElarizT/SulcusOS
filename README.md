@@ -176,3 +176,8 @@ Visualizes supervisor-to-agent relationships for active workflows.
 
 - Runtime behavior is configurable through environment variables used in `main.py`.
 - Logs are written to files such as `agent_runtime.log` and `agent_debug.log`.
+
+### Structured runtime events
+
+Agent OS emits structured runtime events for dashboard observability. These
+events power future filtering, metrics, replay, and debugging features.

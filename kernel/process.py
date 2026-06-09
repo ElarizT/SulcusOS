@@ -19,6 +19,8 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+from kernel.events import RuntimeEvent
+
 from kernel.ipc_protocol import (
     ErrorMessage,
     EventMessage,
@@ -404,6 +406,7 @@ class ExternalAgentRunResult:
     record: ProcessRecord
     output: str
     error: str | None = None
+    events: tuple[RuntimeEvent, ...] = ()
 
     @property
     def succeeded(self) -> bool:
@@ -457,6 +460,14 @@ class ProcessRegistry:
         from agentos.loader import load_external_agent
 
         manifest = load_external_agent(raw_path)
+        events = [
+            RuntimeEvent.info(
+                "ExternalAgentRuntime",
+                "external_agent_loaded",
+                f"Loaded external agent {manifest.name}",
+                {"agent": manifest.name},
+            )
+        ]
         self._validate_allowed_path(manifest.project_dir)
         self._validate_allowed_path(manifest.entrypoint_path)
         self._preflight_source(manifest.entrypoint_path)
@@ -511,15 +522,39 @@ class ProcessRegistry:
         captured = io.StringIO()
         error: str | None = None
         record.state = ProcessState.RUNNING
+        events.append(
+            RuntimeEvent.info(
+                "ExternalAgentRuntime",
+                "external_agent_started",
+                f"Started external agent {manifest.name}",
+                {"agent": manifest.name, "pid": record.pid},
+            )
+        )
         try:
             with contextlib.redirect_stdout(captured):
                 await process.on_start()
                 await process.on_stop()
             record.state = ProcessState.EXITED
+            events.append(
+                RuntimeEvent.info(
+                    "ExternalAgentRuntime",
+                    "external_agent_completed",
+                    f"Completed external agent {manifest.name}",
+                    {"agent": manifest.name, "pid": record.pid},
+                )
+            )
         except Exception as exc:
             record.state = ProcessState.CRASHED
             record.error = traceback.format_exc(limit=8)
             error = str(exc) or exc.__class__.__name__
+            events.append(
+                RuntimeEvent.error(
+                    "ExternalAgentRuntime",
+                    "external_agent_failed",
+                    f"External agent {manifest.name} failed: {error}",
+                    {"agent": manifest.name, "pid": record.pid, "error": error},
+                )
+            )
         finally:
             async with self._lock:
                 await self._cleanup_locked(record)
@@ -529,6 +564,7 @@ class ProcessRegistry:
             record=record,
             output=captured.getvalue().rstrip(),
             error=error,
+            events=tuple(events),
         )
 
     async def _run_path(

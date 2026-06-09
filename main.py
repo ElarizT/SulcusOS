@@ -662,7 +662,7 @@ async def main() -> None:
                 return "Memory Paging demo loaded: Memory Demo Complete"
             if is_external_agent_project_path(argument):
                 result = await process_registry.run_external_project(argument)
-                app.load_external_agent_result(succeeded=result.succeeded)
+                app.load_external_agent_result(succeeded=result.succeeded, events=result.events)
                 return format_external_agent_run(result)
             record = await process_registry.run_path(argument)
             return f"started PID {record.pid} ({record.name}) from {record.path}"
