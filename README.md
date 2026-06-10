@@ -195,3 +195,9 @@ activity inspection, building on structured runtime events and the runtime timel
 ### IPC inspector
 
 Step 21 adds an IPC Inspector for visualizing communication between agents.
+
+### Execution replay
+
+Step 22 adds Execution Replay for deterministic playback of recorded runtime
+events. Replay is intended for debugging, demonstrations, and observability and
+does not influence runtime execution.

@@ -14,6 +14,7 @@ from textual.widgets import DataTable, Footer, Header, Input, RichLog, Static
 from kernel.events import RuntimeEvent, render_runtime_event
 from kernel.ipc_inspector import build_ipc_snapshot, render_ipc_inspector
 from kernel.metrics import build_agent_metrics_snapshot, render_agent_metrics
+from kernel.replay import build_replay_session, render_replay_session
 from kernel.timeline import render_runtime_timeline
 
 SHELL_PROMPT = "AgentOS>"
@@ -137,6 +138,11 @@ class AgentOSDashboard(App[None]):
         overflow: auto;
     }
 
+    #execution-replay {
+        height: 1fr;
+        overflow: auto;
+    }
+
     #shell-input {
         dock: bottom;
         height: 3;
@@ -186,6 +192,7 @@ class AgentOSDashboard(App[None]):
         self._timeline_signature: tuple[str, ...] | None = None
         self._metrics_signature: tuple[str, ...] | None = None
         self._ipc_inspector_signature: tuple[str, ...] | None = None
+        self._replay_signature: tuple[str, ...] | None = None
         self._wasm_placeholder_logged = False
 
     def load_research_team_snapshot(self, state: dict[str, Any]) -> None:
@@ -306,6 +313,8 @@ class AgentOSDashboard(App[None]):
                 yield DataTable(id="process-table")
                 yield Static("Runtime Timeline", id="timeline-title", classes="pane-title")
                 yield Static(id="runtime-timeline")
+                yield Static("Execution Replay", id="replay-title", classes="pane-title")
+                yield Static(id="execution-replay")
         yield Input(
             placeholder=f"{SHELL_PROMPT} run <path> | inspect <path> | demos | ps | kill <PID>",
             id="shell-input",
@@ -359,6 +368,7 @@ class AgentOSDashboard(App[None]):
         self._render_supervision_events()
         self._render_runtime_events()
         self._render_timeline()
+        self._render_replay()
         self.run_worker(self._refresh_process_rows(), exclusive=True, group="process-refresh")
 
     async def _refresh_process_rows(self) -> None:
@@ -525,13 +535,7 @@ class AgentOSDashboard(App[None]):
         self._logged_runtime_events = len(self._runtime_events)
 
     def _render_timeline(self) -> None:
-        events: list[Any] = []
-        if self._demo_supervision_events is not None:
-            events.extend(self._demo_supervision_events)
-        elif self.supervision_event_snapshot is not None:
-            events.extend(self.supervision_event_snapshot())
-        events.extend(self._runtime_events)
-
+        events = self._observable_events()
         rows = render_runtime_timeline(events)
         signature = tuple(rows)
         if signature == self._timeline_signature:
@@ -539,6 +543,25 @@ class AgentOSDashboard(App[None]):
         self._timeline_signature = signature
         content = "\n".join(rows) if rows else "[dim]No runtime events yet.[/]"
         self._update_scrollable_static_follow_end("#runtime-timeline", content)
+
+    def _render_replay(self) -> None:
+        session = build_replay_session(self._observable_events())
+        rows = render_replay_session(session)
+        signature = tuple(rows)
+        if signature == self._replay_signature:
+            return
+        self._replay_signature = signature
+        content = "\n".join(rows) if rows else "[dim]No replay data available.[/]"
+        self._update_scrollable_static_follow_end("#execution-replay", content)
+
+    def _observable_events(self) -> list[Any]:
+        events: list[Any] = []
+        if self._demo_supervision_events is not None:
+            events.extend(self._demo_supervision_events)
+        elif self.supervision_event_snapshot is not None:
+            events.extend(self.supervision_event_snapshot())
+        events.extend(self._runtime_events)
+        return events
 
     def _render_agent_metrics(self) -> None:
         events: list[Any] = []
