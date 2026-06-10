@@ -201,3 +201,9 @@ Step 21 adds an IPC Inspector for visualizing communication between agents.
 Step 22 adds Execution Replay for deterministic playback of recorded runtime
 events. Replay is intended for debugging, demonstrations, and observability and
 does not influence runtime execution.
+
+### Agent dependency graph
+
+Step 23 adds an Agent Dependency Graph for inspecting observed workflow
+structure and communication dependencies between agents. It is observability-only
+and does not introduce dependency scheduling yet.

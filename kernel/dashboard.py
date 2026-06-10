@@ -11,6 +11,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Container, Vertical
 from textual.widgets import DataTable, Footer, Header, Input, RichLog, Static
 
+from kernel.dependency_graph import build_dependency_graph, render_dependency_graph
 from kernel.events import RuntimeEvent, render_runtime_event
 from kernel.ipc_inspector import build_ipc_snapshot, render_ipc_inspector
 from kernel.metrics import build_agent_metrics_snapshot, render_agent_metrics
@@ -57,7 +58,7 @@ class AgentOSDashboard(App[None]):
         layout: grid;
         grid-size: 2 3;
         grid-columns: 1fr 1fr;
-        grid-rows: 1fr 2fr 2fr;
+        grid-rows: 1fr 2fr 3fr;
         height: 1fr;
     }
 
@@ -119,6 +120,12 @@ class AgentOSDashboard(App[None]):
     }
 
     #agent-tree {
+        height: 7;
+        min-height: 7;
+        overflow: auto;
+    }
+
+    #dependency-graph {
         height: 1fr;
         overflow: auto;
     }
@@ -193,6 +200,7 @@ class AgentOSDashboard(App[None]):
         self._metrics_signature: tuple[str, ...] | None = None
         self._ipc_inspector_signature: tuple[str, ...] | None = None
         self._replay_signature: tuple[str, ...] | None = None
+        self._dependency_graph_signature: tuple[str, ...] | None = None
         self._wasm_placeholder_logged = False
 
     def load_research_team_snapshot(self, state: dict[str, Any]) -> None:
@@ -308,6 +316,8 @@ class AgentOSDashboard(App[None]):
             with Vertical(id="agent-tree-pane", classes="pane"):
                 yield Static("Agent Tree View", classes="pane-title")
                 yield Static(id="agent-tree")
+                yield Static("Agent Dependency Graph", id="dependency-graph-title", classes="pane-title")
+                yield Static(id="dependency-graph")
             with Vertical(id="process-pane", classes="pane"):
                 yield Static("Process Registry", classes="pane-title")
                 yield DataTable(id="process-table")
@@ -364,6 +374,7 @@ class AgentOSDashboard(App[None]):
         self._render_ipc_inspector(mailboxes)
         self._render_memory(memory_agents)
         self._render_agent_tree()
+        self._render_dependency_graph()
         self._render_wasm_log(wasm_runs)
         self._render_supervision_events()
         self._render_runtime_events()
@@ -578,15 +589,8 @@ class AgentOSDashboard(App[None]):
         self._update_scrollable_static_follow_end("#agent-metrics", content)
 
     def _render_ipc_inspector(self, mailboxes: list[MailboxMetric] | None = None) -> None:
-        records: list[Any] = list(self._demo_ipc_records or ())
-        records.extend(
-            event
-            for event in self._runtime_events
-            if ("sender" in event.metadata or "source" in event.metadata)
-            and ("receiver" in event.metadata or "target" in event.metadata)
-        )
         snapshot = build_ipc_snapshot(
-            records,
+            self._ipc_records(),
             process_rows=self._process_rows,
             mailbox_metrics=mailboxes or self._read_mailboxes(),
         )
@@ -597,6 +601,29 @@ class AgentOSDashboard(App[None]):
         self._ipc_inspector_signature = signature
         content = "\n".join(rows) if rows else "[dim]No IPC activity yet.[/]"
         self._update_scrollable_static_follow_end("#ipc-inspector", content)
+
+    def _render_dependency_graph(self) -> None:
+        snapshot = build_dependency_graph(
+            process_rows=self._process_rows,
+            events=self._observable_events(),
+            ipc_records=self._ipc_records(),
+        )
+        rows = render_dependency_graph(snapshot)
+        signature = tuple(rows)
+        if signature == self._dependency_graph_signature:
+            return
+        self._dependency_graph_signature = signature
+        self._update_scrollable_static_follow_end("#dependency-graph", "\n".join(rows))
+
+    def _ipc_records(self) -> list[Any]:
+        records: list[Any] = list(self._demo_ipc_records or ())
+        records.extend(
+            event
+            for event in self._runtime_events
+            if ("sender" in event.metadata or "source" in event.metadata)
+            and ("receiver" in event.metadata or "target" in event.metadata)
+        )
+        return records
 
     def _render_processes(self, rows: list[dict[str, Any]]) -> None:
         signature = tuple(
