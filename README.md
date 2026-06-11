@@ -232,3 +232,29 @@ provider = OpenAICompatibleProvider(
 runtime = LLMRuntime(provider=provider)
 response = runtime.chat(messages=[{"role": "user", "content": "Hello"}])
 ```
+
+Step 26 adds provider routing and fallback support for the LLM Runtime Layer.
+Registry-based runtimes select providers by stable route name and try configured
+fallbacks in deterministic order when a provider raises `LLMProviderError`.
+Routing and fallback events contain safe metadata only.
+
+```python
+runtime = LLMRuntime(
+    providers={
+        "primary": OpenAICompatibleProvider(
+            api_key="placeholder-openai-key",
+            default_model="gpt-4.1-mini",
+        ),
+        "fast": OpenAICompatibleProvider(
+            api_key="placeholder-groq-key",
+            provider_name="groq",
+            base_url="https://api.groq.com/openai/v1",
+            default_model="openai/gpt-oss-20b",
+        ),
+    },
+    default_provider="primary",
+    fallback_providers=["fast"],
+)
+
+response = runtime.chat(messages=[{"role": "user", "content": "Hello"}])
+```
