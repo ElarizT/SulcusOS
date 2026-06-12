@@ -14,6 +14,35 @@ class LLMRuntimeError(RuntimeError):
 class LLMProviderError(LLMRuntimeError):
     """Raised when an LLM provider cannot complete a request."""
 
+    def __init__(self, *args: object, category: str = "provider") -> None:
+        super().__init__(*args)
+        self.category = category
+
+
+def classify_llm_error(error: Exception) -> str:
+    """Classify provider failures without exposing their message contents."""
+    category = getattr(error, "category", None)
+    if isinstance(category, str) and category:
+        return category
+
+    error_name = error.__class__.__name__.lower()
+    if isinstance(error, TimeoutError) or "timeout" in error_name:
+        return "timeout"
+    if "ratelimit" in error_name or "rate_limit" in error_name:
+        return "rate_limit"
+    if isinstance(error, ImportError) or any(
+        marker in error_name
+        for marker in ("authentication", "configuration", "dependency")
+    ):
+        return "configuration"
+    if isinstance(error, ConnectionError) or any(
+        marker in error_name for marker in ("connection", "temporary", "transient")
+    ):
+        return "transient"
+    if isinstance(error, LLMProviderError):
+        return "provider"
+    return "unknown"
+
 
 @runtime_checkable
 class LLMProvider(Protocol):

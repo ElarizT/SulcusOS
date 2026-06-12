@@ -6,7 +6,7 @@ import os
 from collections.abc import Mapping
 from typing import Any
 
-from kernel.llm.providers import LLMProviderError
+from kernel.llm.providers import LLMProviderError, classify_llm_error
 from kernel.llm.types import LLMRequest, LLMResponse, LLMUsage
 
 
@@ -23,6 +23,10 @@ class OpenAICompatibleProvider:
         timeout_seconds: float = 30.0,
         client: Any | None = None,
     ) -> None:
+        if isinstance(timeout_seconds, bool) or not isinstance(
+            timeout_seconds, (int, float)
+        ):
+            raise ValueError("timeout_seconds must be a positive number")
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
 
@@ -40,15 +44,19 @@ class OpenAICompatibleProvider:
         if not self.api_key:
             raise LLMProviderError(
                 "OpenAI-compatible provider requires an API key; set "
-                "AGENTOS_LLM_API_KEY or pass api_key"
+                "AGENTOS_LLM_API_KEY or pass api_key",
+                category="configuration",
             )
 
         client = self._get_client()
         payload = _request_payload(request)
         try:
             completion = client.chat.completions.create(**payload)
-        except Exception:
-            raise LLMProviderError("OpenAI-compatible provider request failed") from None
+        except Exception as exc:
+            raise LLMProviderError(
+                "OpenAI-compatible provider request failed",
+                category=classify_llm_error(exc),
+            ) from None
 
         return _response_from_completion(completion, provider=self.name, request=request)
 
@@ -60,7 +68,8 @@ class OpenAICompatibleProvider:
             from openai import OpenAI
         except (ImportError, ModuleNotFoundError):
             raise LLMProviderError(
-                "OpenAI-compatible provider requires the optional 'openai' package"
+                "OpenAI-compatible provider requires the optional 'openai' package",
+                category="configuration",
             ) from None
 
         client_options: dict[str, Any] = {
@@ -73,7 +82,8 @@ class OpenAICompatibleProvider:
             self._client = OpenAI(**client_options)
         except Exception:
             raise LLMProviderError(
-                "OpenAI-compatible provider client initialization failed"
+                "OpenAI-compatible provider client initialization failed",
+                category="configuration",
             ) from None
         return self._client
 
@@ -97,6 +107,8 @@ def _request_payload(request: LLMRequest) -> dict[str, Any]:
     max_tokens = _safe_max_tokens(request.metadata)
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
+    if request.timeout_seconds is not None:
+        payload["timeout"] = request.timeout_seconds
     return payload
 
 

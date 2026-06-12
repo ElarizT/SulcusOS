@@ -7,6 +7,45 @@ from typing import Any
 
 
 @dataclass(frozen=True)
+class LLMRetryPolicy:
+    """Deterministic retry settings applied to each provider attempt."""
+
+    max_attempts: int = 1
+    retry_on: tuple[str, ...] = ("timeout", "rate_limit", "transient")
+    backoff_seconds: float = 0.0
+    max_backoff_seconds: float | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.retry_on, str):
+            raise ValueError("retry_on must be a sequence of categories")
+        object.__setattr__(self, "retry_on", tuple(self.retry_on))
+        if (
+            isinstance(self.max_attempts, bool)
+            or not isinstance(self.max_attempts, int)
+            or self.max_attempts < 1
+        ):
+            raise ValueError("max_attempts must be a positive integer")
+        if isinstance(self.backoff_seconds, bool) or not isinstance(
+            self.backoff_seconds, (int, float)
+        ):
+            raise ValueError("backoff_seconds must be a nonnegative number")
+        if self.backoff_seconds < 0:
+            raise ValueError("backoff_seconds must not be negative")
+        if self.max_backoff_seconds is not None:
+            if isinstance(self.max_backoff_seconds, bool) or not isinstance(
+                self.max_backoff_seconds, (int, float)
+            ):
+                raise ValueError("max_backoff_seconds must be a nonnegative number")
+            if self.max_backoff_seconds < 0:
+                raise ValueError("max_backoff_seconds must not be negative")
+        if any(
+            not isinstance(category, str) or not category.strip()
+            for category in self.retry_on
+        ):
+            raise ValueError("retry_on categories must not be empty")
+
+
+@dataclass(frozen=True)
 class LLMMessage:
     role: str
     content: str
@@ -37,6 +76,7 @@ class LLMRequest:
     model: str
     temperature: float = 0.0
     metadata: dict[str, Any] = field(default_factory=dict)
+    timeout_seconds: float | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "messages", tuple(self.messages))
@@ -45,6 +85,13 @@ class LLMRequest:
             raise ValueError("LLM request must contain at least one message")
         if not self.model.strip():
             raise ValueError("LLM request model must not be empty")
+        if self.timeout_seconds is not None:
+            if isinstance(self.timeout_seconds, bool) or not isinstance(
+                self.timeout_seconds, (int, float)
+            ):
+                raise ValueError("timeout_seconds must be a positive number")
+            if self.timeout_seconds <= 0:
+                raise ValueError("timeout_seconds must be positive")
 
 
 @dataclass(frozen=True)

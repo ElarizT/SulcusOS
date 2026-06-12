@@ -258,3 +258,24 @@ runtime = LLMRuntime(
 
 response = runtime.chat(messages=[{"role": "user", "content": "Hello"}])
 ```
+
+Step 27 adds deterministic LLM retry policies and timeout support. Retries are
+applied to each provider before the runtime moves to the next configured
+fallback. The default policy remains one attempt with no retry.
+
+```python
+from kernel.llm import LLMRetryPolicy, LLMRuntime
+
+runtime = LLMRuntime(
+    providers={...},
+    default_provider="primary",
+    fallback_providers=["fast"],
+    retry_policy=LLMRetryPolicy(
+        max_attempts=2,
+        retry_on=("timeout", "rate_limit", "transient"),
+    ),
+    timeout_seconds=30,
+)
+
+response = runtime.chat(messages=[{"role": "user", "content": "Hello"}])
+```

@@ -3,11 +3,23 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from time import sleep
 from typing import Any
 
 from kernel.events import RuntimeEvent
-from kernel.llm.providers import LLMProvider, LLMProviderError, LLMRuntimeError
-from kernel.llm.types import LLMMessage, LLMRequest, LLMResponse, LLMUsage
+from kernel.llm.providers import (
+    LLMProvider,
+    LLMProviderError,
+    LLMRuntimeError,
+    classify_llm_error,
+)
+from kernel.llm.types import (
+    LLMMessage,
+    LLMRequest,
+    LLMResponse,
+    LLMRetryPolicy,
+    LLMUsage,
+)
 
 
 EventSink = Callable[[RuntimeEvent], None] | Any
@@ -25,6 +37,9 @@ class LLMRuntime:
         providers: Mapping[str, LLMProvider] | None = None,
         default_provider: str | None = None,
         fallback_providers: Sequence[str] | None = None,
+        retry_policy: LLMRetryPolicy | None = None,
+        timeout_seconds: float | None = None,
+        sleeper: Callable[[float], None] = sleep,
     ) -> None:
         if provider is not None and providers is not None:
             raise LLMRuntimeError("configure either provider or providers, not both")
@@ -34,6 +49,18 @@ class LLMRuntime:
         self.providers = _provider_registry(providers) if providers is not None else {}
         self.default_provider = _optional_provider_name(default_provider, "default_provider")
         self.fallback_providers = _provider_names(fallback_providers or ())
+        self.retry_policy = retry_policy or LLMRetryPolicy()
+        if not isinstance(self.retry_policy, LLMRetryPolicy):
+            raise LLMRuntimeError("retry_policy must be an LLMRetryPolicy")
+        if timeout_seconds is not None:
+            if isinstance(timeout_seconds, bool) or not isinstance(
+                timeout_seconds, (int, float)
+            ):
+                raise LLMRuntimeError("timeout_seconds must be a positive number")
+            if timeout_seconds <= 0:
+                raise LLMRuntimeError("timeout_seconds must be positive")
+        self.timeout_seconds = timeout_seconds
+        self._sleeper = sleeper
         self._uses_registry = providers is not None
 
         if self._uses_registry:
@@ -60,6 +87,7 @@ class LLMRuntime:
         temperature: float = 0.0,
         metadata: Mapping[str, Any] | None = None,
         provider: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> LLMResponse:
         if self._uses_registry:
             return self._chat_with_routing(
@@ -68,6 +96,7 @@ class LLMRuntime:
                 temperature=temperature,
                 metadata=metadata,
                 provider=provider,
+                timeout_seconds=timeout_seconds,
             )
         if provider is not None:
             raise LLMRuntimeError(
@@ -78,6 +107,7 @@ class LLMRuntime:
             model=model,
             temperature=temperature,
             metadata=metadata,
+            timeout_seconds=timeout_seconds,
         )
 
     def _chat_single_provider(
@@ -87,6 +117,7 @@ class LLMRuntime:
         model: str | None,
         temperature: float,
         metadata: Mapping[str, Any] | None,
+        timeout_seconds: float | None,
     ) -> LLMResponse:
         active_provider = self.provider
         if active_provider is None:
@@ -97,6 +128,7 @@ class LLMRuntime:
             model=resolved_model,
             temperature=temperature,
             metadata=dict(metadata or {}),
+            timeout_seconds=_resolve_timeout(timeout_seconds, self.timeout_seconds),
         )
         provider_name = _provider_name(active_provider)
         event_metadata = {"provider": provider_name, "model": request.model}
@@ -110,9 +142,11 @@ class LLMRuntime:
         )
 
         try:
-            response = active_provider.complete(request)
-            if not isinstance(response, LLMResponse):
-                raise TypeError("provider returned an invalid LLM response")
+            response = self._complete_with_retries(
+                active_provider,
+                provider_name=provider_name,
+                request=request,
+            )
         except Exception as exc:
             self._emit(
                 RuntimeEvent.error(
@@ -153,6 +187,7 @@ class LLMRuntime:
         temperature: float,
         metadata: Mapping[str, Any] | None,
         provider: str | None,
+        timeout_seconds: float | None,
     ) -> LLMResponse:
         selected_name = _optional_provider_name(provider, "provider") or self.default_provider
         if selected_name is None:
@@ -168,6 +203,7 @@ class LLMRuntime:
             model=model or _default_model(selected_provider),
             temperature=temperature,
             metadata=dict(metadata or {}),
+            timeout_seconds=_resolve_timeout(timeout_seconds, self.timeout_seconds),
         )
         self._emit_routing_event(
             "llm.provider_selected",
@@ -202,9 +238,11 @@ class LLMRuntime:
                     },
                 )
             try:
-                response = self.providers[provider_name].complete(request)
-                if not isinstance(response, LLMResponse):
-                    raise TypeError("provider returned an invalid LLM response")
+                response = self._complete_with_retries(
+                    self.providers[provider_name],
+                    provider_name=provider_name,
+                    request=request,
+                )
             except LLMProviderError as exc:
                 self._emit_routing_event(
                     "llm.provider_failed",
@@ -232,6 +270,9 @@ class LLMRuntime:
                     },
                     error=True,
                 )
+                category = classify_llm_error(exc)
+                if category != "configuration" and category in self.retry_policy.retry_on:
+                    continue
                 self._emit(
                     RuntimeEvent.error(
                         "LLMRuntime",
@@ -304,6 +345,107 @@ class LLMRuntime:
         raise LLMProviderError(
             f"All LLM providers failed after {len(attempts)} attempts: {provider_summary}"
         ) from None
+
+    def _complete_with_retries(
+        self,
+        provider: LLMProvider,
+        *,
+        provider_name: str,
+        request: LLMRequest,
+    ) -> LLMResponse:
+        policy = self.retry_policy
+        last_category: str | None = None
+        last_error_type: str | None = None
+        for attempt in range(1, policy.max_attempts + 1):
+            try:
+                response = provider.complete(request)
+                if not isinstance(response, LLMResponse):
+                    raise TypeError("provider returned an invalid LLM response")
+            except Exception as exc:
+                category = classify_llm_error(exc)
+                retryable = category != "configuration" and category in policy.retry_on
+                if not retryable or attempt >= policy.max_attempts:
+                    if retryable and policy.max_attempts > 1:
+                        self._emit_retry_event(
+                            "llm.retry_exhausted",
+                            f"LLM retries exhausted for {provider_name}",
+                            provider_name,
+                            request.model,
+                            attempt,
+                            category,
+                            exc.__class__.__name__,
+                            error=True,
+                        )
+                    raise
+
+                backoff_seconds = _retry_backoff(policy, attempt)
+                self._emit_retry_event(
+                    "llm.retry_scheduled",
+                    f"LLM retry scheduled for {provider_name}",
+                    provider_name,
+                    request.model,
+                    attempt + 1,
+                    category,
+                    exc.__class__.__name__,
+                    backoff_seconds=backoff_seconds,
+                )
+                if backoff_seconds > 0:
+                    self._sleeper(backoff_seconds)
+                self._emit_retry_event(
+                    "llm.retry_started",
+                    f"LLM retry started for {provider_name}",
+                    provider_name,
+                    request.model,
+                    attempt + 1,
+                    category,
+                    exc.__class__.__name__,
+                    backoff_seconds=backoff_seconds,
+                )
+                last_category = category
+                last_error_type = exc.__class__.__name__
+                continue
+
+            if attempt > 1:
+                self._emit_retry_event(
+                    "llm.retry_succeeded",
+                    f"LLM retry succeeded for {provider_name}",
+                    provider_name,
+                    response.model,
+                    attempt,
+                    last_category,
+                    last_error_type,
+                )
+            return response
+
+        raise AssertionError("retry loop completed without a response or error")
+
+    def _emit_retry_event(
+        self,
+        event_type: str,
+        message: str,
+        provider: str,
+        model: str,
+        attempt: int,
+        category: str | None,
+        error_type: str | None,
+        *,
+        backoff_seconds: float | None = None,
+        error: bool = False,
+    ) -> None:
+        metadata: dict[str, Any] = {
+            "provider": provider,
+            "model": model,
+            "attempt": attempt,
+            "max_attempts": self.retry_policy.max_attempts,
+        }
+        if category is not None:
+            metadata["error_category"] = category
+        if error_type is not None:
+            metadata["error_type"] = error_type
+        if backoff_seconds is not None:
+            metadata["backoff_seconds"] = backoff_seconds
+        factory = RuntimeEvent.error if error else RuntimeEvent.info
+        self._emit(factory("LLMRuntime", event_type, message, metadata))
 
     def _emit_routing_event(
         self,
@@ -401,3 +543,14 @@ def _usage_metadata(usage: LLMUsage | None) -> dict[str, int]:
         for name in ("prompt_tokens", "completion_tokens", "total_tokens")
         if (value := getattr(usage, name)) is not None
     }
+
+
+def _resolve_timeout(request_timeout: float | None, runtime_timeout: float | None) -> float | None:
+    return request_timeout if request_timeout is not None else runtime_timeout
+
+
+def _retry_backoff(policy: LLMRetryPolicy, failed_attempt: int) -> float:
+    backoff = policy.backoff_seconds * (2 ** (failed_attempt - 1))
+    if policy.max_backoff_seconds is not None:
+        backoff = min(backoff, policy.max_backoff_seconds)
+    return backoff

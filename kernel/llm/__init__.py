@@ -9,10 +9,11 @@ from kernel.llm.providers import (
     LLMProvider,
     LLMProviderError,
     LLMRuntimeError,
+    classify_llm_error,
 )
 from kernel.llm.openai_compatible import OpenAICompatibleProvider
 from kernel.llm.runtime import LLMRuntime
-from kernel.llm.types import LLMMessage, LLMRequest, LLMResponse, LLMUsage
+from kernel.llm.types import LLMMessage, LLMRequest, LLMResponse, LLMRetryPolicy, LLMUsage
 
 
 _LEGACY_EXPORTS = {
@@ -42,11 +43,13 @@ __all__ = [
     "LLMProviderError",
     "LLMRequest",
     "LLMResponse",
+    "LLMRetryPolicy",
     "LLMRuntime",
     "LLMRuntimeError",
     "LLMUsage",
     "LegacyLLMResponse",
     "OpenAICompatibleProvider",
+    "classify_llm_error",
     "extract_python_code_blocks",
     "normalize_code_block",
 ]
