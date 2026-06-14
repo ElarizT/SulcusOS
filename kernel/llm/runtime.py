@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import replace
 from time import sleep
 from typing import Any
 
@@ -18,6 +19,7 @@ from kernel.llm.providers import (
     LLMProvider,
     LLMProviderError,
     LLMRuntimeError,
+    LLMStreamingUnsupportedError,
     classify_llm_error,
 )
 from kernel.llm.types import (
@@ -25,6 +27,7 @@ from kernel.llm.types import (
     LLMRequest,
     LLMResponse,
     LLMRetryPolicy,
+    LLMStreamChunk,
     LLMTokenBudget,
     LLMUsage,
     LLMUsageLedger,
@@ -148,6 +151,351 @@ class LLMRuntime:
             metadata=metadata,
             timeout_seconds=timeout_seconds,
         )
+
+    def stream_chat(
+        self,
+        messages: Sequence[MessageInput],
+        model: str | None = None,
+        temperature: float = 0.0,
+        metadata: Mapping[str, Any] | None = None,
+        provider: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> Iterator[LLMStreamChunk]:
+        """Stream a chat response, retrying or falling back only before output."""
+        if self._uses_registry:
+            selected_name = (
+                _optional_provider_name(provider, "provider") or self.default_provider
+            )
+            if selected_name is None:
+                raise LLMRuntimeError(
+                    "provider must be specified when no default_provider is configured"
+                )
+            _validate_configured_provider(selected_name, self.providers, "requested")
+            attempts = _ordered_unique((selected_name, *self.fallback_providers))
+            selected_provider = self.providers[selected_name]
+        else:
+            if provider is not None:
+                raise LLMRuntimeError(
+                    "explicit provider selection requires a providers registry"
+                )
+            selected_provider = self.provider
+            if selected_provider is None:
+                raise LLMRuntimeError("LLMRuntime has no configured provider")
+            selected_name = _provider_name(selected_provider)
+            attempts = (selected_name,)
+
+        request = LLMRequest(
+            messages=tuple(_coerce_message(message) for message in messages),
+            model=model or _default_model(selected_provider),
+            temperature=temperature,
+            metadata=dict(metadata or {}),
+            timeout_seconds=_resolve_timeout(timeout_seconds, self.timeout_seconds),
+        )
+        self._check_request_budget(request)
+        if self._uses_registry:
+            self._emit_routing_event(
+                "llm.provider_selected",
+                f"LLM provider selected: {selected_name}",
+                {
+                    "provider": selected_name,
+                    "model": request.model,
+                    "attempt": 1,
+                    "success": True,
+                    "streaming": True,
+                },
+            )
+        self._emit_stream_event(
+            "llm.stream_requested",
+            f"LLM stream requested from {selected_name}",
+            {"provider": selected_name, "model": request.model},
+        )
+        if self.cache is not None and self.cache.enabled:
+            self._emit_cache_event(
+                "llm.cache_bypassed",
+                "LLM response cache bypassed for streaming",
+                provider=selected_name,
+                model=request.model,
+                reason="streaming",
+            )
+        return self._stream_with_routing(request, selected_name, attempts)
+
+    def _stream_with_routing(
+        self,
+        request: LLMRequest,
+        selected_name: str,
+        attempts: tuple[str, ...],
+    ) -> Iterator[LLMStreamChunk]:
+        for route_attempt, provider_name in enumerate(attempts, start=1):
+            if route_attempt > 1:
+                self._emit_routing_event(
+                    "llm.fallback_started",
+                    f"LLM fallback started: {provider_name}",
+                    {
+                        "provider": selected_name,
+                        "fallback_provider": provider_name,
+                        "model": request.model,
+                        "attempt": route_attempt,
+                        "success": False,
+                        "streaming": True,
+                    },
+                )
+            active_provider = (
+                self.providers[provider_name] if self._uses_registry else self.provider
+            )
+            if active_provider is None:
+                raise LLMRuntimeError("LLMRuntime has no configured provider")
+
+            try:
+                chunks, usage = yield from self._stream_provider_with_retries(
+                    active_provider,
+                    provider_name=provider_name,
+                    request=request,
+                )
+            except Exception as exc:
+                if isinstance(exc, LLMBudgetExceededError):
+                    raise
+                category = classify_llm_error(exc)
+                if self._uses_registry:
+                    self._emit_routing_event(
+                        "llm.provider_failed",
+                        f"LLM streaming provider failed: {provider_name}",
+                        {
+                            "provider": provider_name,
+                            "model": request.model,
+                            "attempt": route_attempt,
+                            "error_category": category,
+                            "error_type": exc.__class__.__name__,
+                            "success": False,
+                            "streaming": True,
+                        },
+                        error=True,
+                    )
+                if category != "stream_interrupted" and route_attempt < len(attempts) and (
+                    isinstance(exc, LLMProviderError)
+                    or (category != "configuration" and category in self.retry_policy.retry_on)
+                ):
+                    continue
+                if (
+                    category != "stream_interrupted"
+                    and self._uses_registry
+                    and len(attempts) > 1
+                    and route_attempt == len(attempts)
+                ):
+                    self._emit_routing_event(
+                        "llm.fallback_exhausted",
+                        "LLM streaming provider fallbacks exhausted",
+                        {
+                            "provider": selected_name,
+                            "model": request.model,
+                            "attempt": route_attempt,
+                            "success": False,
+                            "streaming": True,
+                        },
+                        error=True,
+                    )
+                self._emit_stream_failed(provider_name, request.model, exc)
+                if isinstance(exc, LLMStreamingUnsupportedError) or (
+                    isinstance(exc, LLMProviderError)
+                    and category == "stream_interrupted"
+                ):
+                    raise
+                raise LLMProviderError(
+                    f"LLM stream failed for provider '{provider_name}'",
+                    category=category,
+                ) from None
+
+            if route_attempt > 1:
+                self._emit_routing_event(
+                    "llm.fallback_succeeded",
+                    f"LLM fallback succeeded: {provider_name}",
+                    {
+                        "provider": selected_name,
+                        "fallback_provider": provider_name,
+                        "model": request.model,
+                        "attempt": route_attempt,
+                        "success": True,
+                        "streaming": True,
+                        **_usage_metadata(usage),
+                    },
+                )
+            self._emit_stream_event(
+                "llm.stream_completed",
+                f"LLM stream completed with {provider_name}",
+                {
+                    "provider": provider_name,
+                    "model": request.model,
+                    "chunk_count": chunks,
+                    **_usage_metadata(usage),
+                },
+            )
+            self._apply_stream_usage(usage)
+            return
+
+        raise AssertionError("stream routing loop completed without a result")
+
+    def _stream_provider_with_retries(
+        self,
+        provider: LLMProvider,
+        *,
+        provider_name: str,
+        request: LLMRequest,
+    ) -> Iterator[LLMStreamChunk]:
+        stream = getattr(provider, "stream", None)
+        if not callable(stream) or getattr(provider, "supports_streaming", True) is False:
+            raise LLMStreamingUnsupportedError(
+                f"LLM provider '{provider_name}' does not support streaming"
+            )
+
+        policy = self.retry_policy
+        last_category: str | None = None
+        last_error_type: str | None = None
+        for attempt in range(1, policy.max_attempts + 1):
+            yielded = 0
+            final_usage: LLMUsage | None = None
+            started = False
+            try:
+                stream_iterator = iter(stream(request))
+                for raw_chunk in stream_iterator:
+                    if not isinstance(raw_chunk, LLMStreamChunk):
+                        raise TypeError("provider returned an invalid LLM stream chunk")
+                    chunk = replace(
+                        raw_chunk,
+                        provider=raw_chunk.provider or provider_name,
+                        model=raw_chunk.model or request.model,
+                    )
+                    if not started:
+                        self._emit_stream_event(
+                            "llm.stream_started",
+                            f"LLM stream started with {provider_name}",
+                            {"provider": provider_name, "model": request.model},
+                        )
+                        started = True
+                    self._emit_stream_event(
+                        "llm.stream_chunk",
+                        f"LLM stream chunk received from {provider_name}",
+                        {
+                            "provider": provider_name,
+                            "model": request.model,
+                            "chunk_index": chunk.index,
+                            "delta_chars": len(chunk.delta),
+                            "done": chunk.done,
+                            **_usage_metadata(chunk.usage if chunk.done else None),
+                        },
+                    )
+                    yielded += 1
+                    if chunk.done and chunk.usage is not None:
+                        final_usage = chunk.usage
+                    yield chunk
+                if not started:
+                    self._emit_stream_event(
+                        "llm.stream_started",
+                        f"LLM stream started with {provider_name}",
+                        {"provider": provider_name, "model": request.model},
+                    )
+            except Exception as exc:
+                category = classify_llm_error(exc)
+                if yielded:
+                    raise LLMProviderError(
+                        f"LLM stream failed after output started for provider '{provider_name}'",
+                        category="stream_interrupted",
+                    ) from None
+                retryable = category != "configuration" and category in policy.retry_on
+                if not retryable or attempt >= policy.max_attempts:
+                    if retryable and policy.max_attempts > 1:
+                        self._emit_retry_event(
+                            "llm.retry_exhausted",
+                            f"LLM streaming retries exhausted for {provider_name}",
+                            provider_name,
+                            request.model,
+                            attempt,
+                            category,
+                            exc.__class__.__name__,
+                            error=True,
+                        )
+                    raise
+                backoff_seconds = _retry_backoff(policy, attempt)
+                self._emit_retry_event(
+                    "llm.retry_scheduled",
+                    f"LLM streaming retry scheduled for {provider_name}",
+                    provider_name,
+                    request.model,
+                    attempt + 1,
+                    category,
+                    exc.__class__.__name__,
+                    backoff_seconds=backoff_seconds,
+                )
+                if backoff_seconds > 0:
+                    self._sleeper(backoff_seconds)
+                self._emit_retry_event(
+                    "llm.retry_started",
+                    f"LLM streaming retry started for {provider_name}",
+                    provider_name,
+                    request.model,
+                    attempt + 1,
+                    category,
+                    exc.__class__.__name__,
+                    backoff_seconds=backoff_seconds,
+                )
+                last_category = category
+                last_error_type = exc.__class__.__name__
+                continue
+
+            if attempt > 1:
+                self._emit_retry_event(
+                    "llm.retry_succeeded",
+                    f"LLM streaming retry succeeded for {provider_name}",
+                    provider_name,
+                    request.model,
+                    attempt,
+                    last_category,
+                    last_error_type,
+                )
+            return yielded, final_usage
+
+        raise AssertionError("stream retry loop completed without a result or error")
+
+    def _apply_stream_usage(self, usage: LLMUsage | None) -> None:
+        if usage is None:
+            return
+        self._usage_ledger = apply_usage_to_ledger(self._usage_ledger, usage)
+        budget = self.token_budget
+        if budget is None:
+            return
+        self._emit_budget_event(
+            "llm.budget_updated",
+            "LLM token budget usage updated",
+            (),
+        )
+        self._handle_budget_exceeded(check_token_budget(budget, self._usage_ledger))
+
+    def _emit_stream_failed(
+        self,
+        provider: str,
+        model: str,
+        error: Exception,
+    ) -> None:
+        self._emit_stream_event(
+            "llm.stream_failed",
+            f"LLM stream failed for {provider}",
+            {
+                "provider": provider,
+                "model": model,
+                "error_category": classify_llm_error(error),
+                "error_type": error.__class__.__name__,
+            },
+            error=True,
+        )
+
+    def _emit_stream_event(
+        self,
+        event_type: str,
+        message: str,
+        metadata: dict[str, Any],
+        *,
+        error: bool = False,
+    ) -> None:
+        factory = RuntimeEvent.error if error else RuntimeEvent.info
+        self._emit(factory("LLMRuntime", event_type, message, metadata))
 
     def _chat_single_provider(
         self,

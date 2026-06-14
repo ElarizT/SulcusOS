@@ -326,3 +326,19 @@ Cache keys include the provider route, model, messages, temperature, and
 supported `max_tokens` option. A fallback response is cached under the provider
 route that succeeded. Set request metadata `cache=False` (or
 `options={"cache": False}`) to opt out for one request.
+
+Step 30 adds a provider-neutral LLM streaming interface. Providers may opt into
+streaming support while existing completion-only providers remain compatible.
+Retries and fallbacks are allowed only before the first chunk is yielded.
+
+```python
+for chunk in runtime.stream_chat(messages=[{"role": "user", "content": "Hello"}]):
+    print(chunk.delta, end="")
+```
+
+Streamed text is not logged by default; stream events contain safe values such
+as provider, model, chunk index, and delta character count. Streaming bypasses
+the response cache for now and never caches partial chunks. Provider-reported
+usage is counted once when final usage is available after stream completion.
+The OpenAI-compatible adapter remains completion-only in Step 30 and fails
+streaming requests with a clean unsupported-streaming error.

@@ -12,11 +12,14 @@ from kernel.llm.cache import (
 )
 from kernel.llm.providers import (
     DeterministicLLMProvider,
+    DeterministicStreamingLLMProvider,
     EchoLLMProvider,
     LLMBudgetExceededError,
     LLMProvider,
     LLMProviderError,
     LLMRuntimeError,
+    LLMStreamingUnsupportedError,
+    StreamingLLMProvider,
     classify_llm_error,
 )
 from kernel.llm.openai_compatible import OpenAICompatibleProvider
@@ -26,6 +29,8 @@ from kernel.llm.types import (
     LLMRequest,
     LLMResponse,
     LLMRetryPolicy,
+    LLMStreamChunk,
+    LLMStreamResult,
     LLMTokenBudget,
     LLMUsage,
     LLMUsageLedger,
@@ -54,6 +59,7 @@ def __getattr__(name: str) -> Any:
 __all__ = [
     "AsyncLLMManager",
     "DeterministicLLMProvider",
+    "DeterministicStreamingLLMProvider",
     "EchoLLMProvider",
     "LLMConfig",
     "LLMCacheEntry",
@@ -71,10 +77,14 @@ __all__ = [
     "LLMTokenBudget",
     "LLMRuntime",
     "LLMRuntimeError",
+    "LLMStreamChunk",
+    "LLMStreamResult",
+    "LLMStreamingUnsupportedError",
     "LLMUsage",
     "LLMUsageLedger",
     "LegacyLLMResponse",
     "OpenAICompatibleProvider",
+    "StreamingLLMProvider",
     "classify_llm_error",
     "apply_usage_to_ledger",
     "build_llm_cache_key",

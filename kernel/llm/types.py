@@ -195,3 +195,53 @@ class LLMResponse:
             raise ValueError("LLM response model must not be empty")
         if not self.provider.strip():
             raise ValueError("LLM response provider must not be empty")
+
+
+@dataclass(frozen=True)
+class LLMStreamChunk:
+    """One immutable partial response from a streaming LLM provider."""
+
+    delta: str
+    index: int
+    provider: str | None = None
+    model: str | None = None
+    done: bool = False
+    usage: LLMUsage | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.delta, str):
+            raise ValueError("LLM stream chunk delta must be a string")
+        if (
+            isinstance(self.index, bool)
+            or not isinstance(self.index, int)
+            or self.index < 0
+        ):
+            raise ValueError("LLM stream chunk index must be a nonnegative integer")
+        for name in ("provider", "model"):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(f"LLM stream chunk {name} must not be empty")
+        if not isinstance(self.done, bool):
+            raise ValueError("LLM stream chunk done must be a boolean")
+        object.__setattr__(self, "metadata", dict(self.metadata))
+
+
+@dataclass(frozen=True)
+class LLMStreamResult:
+    """Optional collected representation of a completed LLM stream."""
+
+    content: str
+    chunks: tuple[LLMStreamChunk, ...]
+    model: str
+    provider: str
+    usage: LLMUsage | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "chunks", tuple(self.chunks))
+        object.__setattr__(self, "metadata", dict(self.metadata))
+        if not self.model.strip():
+            raise ValueError("LLM stream result model must not be empty")
+        if not self.provider.strip():
+            raise ValueError("LLM stream result provider must not be empty")

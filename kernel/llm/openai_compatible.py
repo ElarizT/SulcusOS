@@ -13,6 +13,8 @@ from kernel.llm.types import LLMRequest, LLMResponse, LLMUsage
 class OpenAICompatibleProvider:
     """Small, lazily initialized adapter for OpenAI-compatible APIs."""
 
+    supports_streaming = False
+
     def __init__(
         self,
         *,

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator, Sequence
 from typing import Protocol, runtime_checkable
 
-from kernel.llm.types import LLMRequest, LLMResponse, LLMUsage
+from kernel.llm.types import LLMRequest, LLMResponse, LLMStreamChunk, LLMUsage
 
 
 class LLMRuntimeError(RuntimeError):
@@ -21,6 +22,13 @@ class LLMProviderError(LLMRuntimeError):
     def __init__(self, *args: object, category: str = "provider") -> None:
         super().__init__(*args)
         self.category = category
+
+
+class LLMStreamingUnsupportedError(LLMProviderError):
+    """Raised when a provider does not opt into streaming support."""
+
+    def __init__(self, *args: object) -> None:
+        super().__init__(*args, category="unsupported")
 
 
 def classify_llm_error(error: Exception) -> str:
@@ -56,6 +64,16 @@ class LLMProvider(Protocol):
 
     def complete(self, request: LLMRequest) -> LLMResponse:
         """Complete one structured LLM request."""
+
+
+@runtime_checkable
+class StreamingLLMProvider(Protocol):
+    """Optional interface implemented by providers that support streaming."""
+
+    name: str
+
+    def stream(self, request: LLMRequest) -> Iterator[LLMStreamChunk]:
+        """Stream one structured LLM request."""
 
 
 class DeterministicLLMProvider:
@@ -101,6 +119,51 @@ class EchoLLMProvider(DeterministicLLMProvider):
     def complete(self, request: LLMRequest) -> LLMResponse:
         self.content = request.messages[-1].content
         return super().complete(request)
+
+
+class DeterministicStreamingLLMProvider(DeterministicLLMProvider):
+    """Predictable streaming provider for tests and offline development."""
+
+    supports_streaming = True
+
+    def __init__(
+        self,
+        chunks: Sequence[str] = ("Hello", " ", "world"),
+        *,
+        fail: bool = False,
+    ) -> None:
+        self.chunks = tuple(chunks)
+        super().__init__("".join(self.chunks), fail=fail)
+
+    def stream(self, request: LLMRequest) -> Iterator[LLMStreamChunk]:
+        self.requests.append(request)
+        if self.fail:
+            raise LLMProviderError("deterministic streaming provider failure")
+
+        for index, delta in enumerate(self.chunks):
+            yield LLMStreamChunk(
+                delta=delta,
+                index=index,
+                provider=self.name,
+                model=request.model,
+                metadata={"deterministic": True},
+            )
+
+        prompt_tokens = sum(_token_count(message.content) for message in request.messages)
+        completion_tokens = _token_count(self.content)
+        yield LLMStreamChunk(
+            delta="",
+            index=len(self.chunks),
+            provider=self.name,
+            model=request.model,
+            done=True,
+            usage=LLMUsage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
+            ),
+            metadata={"deterministic": True},
+        )
 
 
 def _token_count(content: str) -> int:
