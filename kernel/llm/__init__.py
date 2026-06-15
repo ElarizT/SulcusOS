@@ -10,6 +10,14 @@ from kernel.llm.cache import (
     LLMResponseCache,
     build_llm_cache_key,
 )
+from kernel.llm.cost import (
+    LLMCostLedger,
+    LLMCostRate,
+    LLMCostRecord,
+    LLMCostTable,
+    format_cost_ledger,
+    format_cost_record,
+)
 from kernel.llm.providers import (
     DeterministicLLMProvider,
     DeterministicStreamingLLMProvider,
@@ -62,6 +70,10 @@ __all__ = [
     "DeterministicStreamingLLMProvider",
     "EchoLLMProvider",
     "LLMConfig",
+    "LLMCostLedger",
+    "LLMCostRate",
+    "LLMCostRecord",
+    "LLMCostTable",
     "LLMCacheEntry",
     "LLMCacheKey",
     "LLMCacheStats",
@@ -91,5 +103,7 @@ __all__ = [
     "check_token_budget",
     "extract_python_code_blocks",
     "format_usage_ledger",
+    "format_cost_ledger",
+    "format_cost_record",
     "normalize_code_block",
 ]

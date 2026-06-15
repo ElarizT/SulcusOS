@@ -14,6 +14,13 @@ from kernel.llm.cache import (
     build_llm_cache_key,
     copy_llm_response,
 )
+from kernel.llm.cost import (
+    LLMCostLedger,
+    LLMCostTable,
+    append_cost_record,
+    calculate_cost_record,
+    format_decimal_cost,
+)
 from kernel.llm.providers import (
     LLMBudgetExceededError,
     LLMProvider,
@@ -56,6 +63,7 @@ class LLMRuntime:
         sleeper: Callable[[float], None] = sleep,
         token_budget: LLMTokenBudget | None = None,
         cache: LLMResponseCache | None = None,
+        cost_table: LLMCostTable | None = None,
     ) -> None:
         if provider is not None and providers is not None:
             raise LLMRuntimeError("configure either provider or providers, not both")
@@ -84,6 +92,12 @@ class LLMRuntime:
         if cache is not None and not isinstance(cache, LLMResponseCache):
             raise LLMRuntimeError("cache must be an LLMResponseCache")
         self.cache = cache
+        if cost_table is not None and not isinstance(cost_table, LLMCostTable):
+            raise LLMRuntimeError("cost_table must be an LLMCostTable")
+        self.cost_table = cost_table
+        self._cost_ledger = LLMCostLedger(
+            currency=cost_table.currency if cost_table is not None else "USD"
+        )
         self._uses_registry = providers is not None
 
         if self._uses_registry:
@@ -110,6 +124,10 @@ class LLMRuntime:
     def cache_snapshot(self) -> LLMCacheStats:
         """Return immutable cache statistics, or zeros when no cache exists."""
         return self.cache.stats() if self.cache is not None else LLMCacheStats()
+
+    def cost_snapshot(self) -> LLMCostLedger:
+        """Return an immutable snapshot of configured provider-reported costs."""
+        return self._cost_ledger
 
     def clear_cache(self) -> None:
         """Clear cached responses and emit a safe event when a cache exists."""
@@ -328,6 +346,7 @@ class LLMRuntime:
                     **_usage_metadata(usage),
                 },
             )
+            self._record_cost(_provider_name(active_provider), request.model, usage)
             self._apply_stream_usage(usage)
             return
 
@@ -556,6 +575,7 @@ class LLMRuntime:
                 raise
             raise LLMProviderError(f"LLM provider '{provider_name}' failed") from exc
 
+        self._record_cost(response.provider, response.model, response.usage)
         self._apply_response_usage(response)
         self._store_cached_response(request, provider_name, response)
         self._emit_completed(response)
@@ -690,6 +710,7 @@ class LLMRuntime:
                     f"LLM provider '{provider_name}' failed"
                 ) from None
 
+            self._record_cost(response.provider, response.model, response.usage)
             self._apply_response_usage(response)
             self._store_cached_response(request, provider_name, response)
             if attempt > 1:
@@ -780,6 +801,67 @@ class LLMRuntime:
         )
         exceeded = check_token_budget(budget, self._usage_ledger)
         self._handle_budget_exceeded(exceeded)
+
+    def _record_cost(
+        self,
+        provider: str,
+        model: str,
+        usage: LLMUsage | None,
+    ) -> None:
+        table = self.cost_table
+        if table is None:
+            return
+        if usage is None:
+            self._emit_cost_skipped(provider, model, usage, "missing_usage")
+            return
+        rate = table.match(provider, model)
+        if rate is None:
+            self._emit_cost_skipped(provider, model, usage, "rate_not_found")
+            return
+        record = calculate_cost_record(rate, provider, model, usage)
+        if record is None:
+            self._emit_cost_skipped(provider, model, usage, "incomplete_usage")
+            return
+        self._cost_ledger = append_cost_record(self._cost_ledger, record)
+        self._emit(
+            RuntimeEvent.info(
+                "LLMRuntime",
+                "llm.cost_recorded",
+                f"LLM cost recorded for {provider}",
+                {
+                    "provider": provider,
+                    "model": model,
+                    "prompt_tokens": record.prompt_tokens,
+                    "completion_tokens": record.completion_tokens,
+                    "total_tokens": record.total_tokens,
+                    "total_cost": format_decimal_cost(record.total_cost),
+                    "currency": record.currency,
+                },
+            )
+        )
+
+    def _emit_cost_skipped(
+        self,
+        provider: str,
+        model: str,
+        usage: LLMUsage | None,
+        reason: str,
+    ) -> None:
+        self._emit(
+            RuntimeEvent.info(
+                "LLMRuntime",
+                "llm.cost_skipped",
+                f"LLM cost skipped for {provider}",
+                {
+                    "provider": provider,
+                    "model": model,
+                    **_usage_metadata(usage),
+                    "total_cost": "0",
+                    "currency": self._cost_ledger.currency,
+                    "reason": reason,
+                },
+            )
+        )
 
     def _get_cached_response(
         self,

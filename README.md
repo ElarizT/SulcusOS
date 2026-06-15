@@ -348,3 +348,29 @@ observability. The monitor is built entirely from safe Step 30 RuntimeEvents and
 shows provider, model, status, chunk and character counts, usage, and sanitized
 errors. Streamed text and prompts are not displayed by default. The panel is
 useful for live debugging and demos while preserving dashboard scroll behavior.
+
+Step 32 adds optional LLM cost accounting based on configured provider/model
+rates. Pricing is user-configured, missing or incomplete usage produces no cost
+estimate, cache hits do not double-count, and no billing API or network access
+is used. The LLM Cost Monitor dashboard panel summarizes safe cost events.
+
+```python
+from kernel.llm import LLMCostRate, LLMCostTable, LLMRuntime
+
+cost_table = LLMCostTable([
+    LLMCostRate(
+        provider="openai",
+        model="gpt-4.1-mini",
+        prompt_per_1m_tokens=0.40,
+        completion_per_1m_tokens=1.60,
+    )
+])
+
+runtime = LLMRuntime(
+    providers={...},
+    cost_table=cost_table,
+)
+
+response = runtime.chat(messages=[...])
+costs = runtime.cost_snapshot()
+```
