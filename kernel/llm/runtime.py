@@ -35,6 +35,7 @@ from kernel.llm.types import (
     LLMResponse,
     LLMRetryPolicy,
     LLMStreamChunk,
+    LLMToolDefinition,
     LLMTokenBudget,
     LLMUsage,
     LLMUsageLedger,
@@ -45,6 +46,7 @@ from kernel.llm.types import (
 
 EventSink = Callable[[RuntimeEvent], None] | Any
 MessageInput = LLMMessage | Mapping[str, Any]
+ToolInput = LLMToolDefinition | Mapping[str, Any]
 
 
 class LLMRuntime:
@@ -148,6 +150,8 @@ class LLMRuntime:
         metadata: Mapping[str, Any] | None = None,
         provider: str | None = None,
         timeout_seconds: float | None = None,
+        tools: Sequence[ToolInput] | None = None,
+        tool_choice: str | Mapping[str, Any] | None = None,
     ) -> LLMResponse:
         if self._uses_registry:
             return self._chat_with_routing(
@@ -157,6 +161,8 @@ class LLMRuntime:
                 metadata=metadata,
                 provider=provider,
                 timeout_seconds=timeout_seconds,
+                tools=tools,
+                tool_choice=tool_choice,
             )
         if provider is not None:
             raise LLMRuntimeError(
@@ -168,6 +174,8 @@ class LLMRuntime:
             temperature=temperature,
             metadata=metadata,
             timeout_seconds=timeout_seconds,
+            tools=tools,
+            tool_choice=tool_choice,
         )
 
     def stream_chat(
@@ -524,6 +532,8 @@ class LLMRuntime:
         temperature: float,
         metadata: Mapping[str, Any] | None,
         timeout_seconds: float | None,
+        tools: Sequence[ToolInput] | None,
+        tool_choice: str | Mapping[str, Any] | None,
     ) -> LLMResponse:
         active_provider = self.provider
         if active_provider is None:
@@ -535,14 +545,18 @@ class LLMRuntime:
             temperature=temperature,
             metadata=dict(metadata or {}),
             timeout_seconds=_resolve_timeout(timeout_seconds, self.timeout_seconds),
+            tools=tuple(_coerce_tool_definition(tool) for tool in tools or ()),
+            tool_choice=tool_choice,
         )
         provider_name = _provider_name(active_provider)
         self._check_request_budget(request)
         cached_response = self._get_cached_response(request, provider_name)
         if cached_response is not None:
+            self._emit_tool_call_events(cached_response)
             self._emit_completed(cached_response)
             return cached_response
         event_metadata = {"provider": provider_name, "model": request.model}
+        self._emit_tools_available(provider_name, request)
         self._emit(
             RuntimeEvent.info(
                 "LLMRuntime",
@@ -578,6 +592,7 @@ class LLMRuntime:
         self._record_cost(response.provider, response.model, response.usage)
         self._apply_response_usage(response)
         self._store_cached_response(request, provider_name, response)
+        self._emit_tool_call_events(response)
         self._emit_completed(response)
         return response
 
@@ -590,6 +605,8 @@ class LLMRuntime:
         metadata: Mapping[str, Any] | None,
         provider: str | None,
         timeout_seconds: float | None,
+        tools: Sequence[ToolInput] | None,
+        tool_choice: str | Mapping[str, Any] | None,
     ) -> LLMResponse:
         selected_name = _optional_provider_name(provider, "provider") or self.default_provider
         if selected_name is None:
@@ -606,6 +623,8 @@ class LLMRuntime:
             temperature=temperature,
             metadata=dict(metadata or {}),
             timeout_seconds=_resolve_timeout(timeout_seconds, self.timeout_seconds),
+            tools=tuple(_coerce_tool_definition(tool) for tool in tools or ()),
+            tool_choice=tool_choice,
         )
         self._check_request_budget(request)
         self._emit_routing_event(
@@ -646,9 +665,11 @@ class LLMRuntime:
                             "cached": True,
                         },
                     )
+                self._emit_tool_call_events(cached_response)
                 self._emit_completed(cached_response)
                 return cached_response
             if attempt == 1:
+                self._emit_tools_available(selected_name, request)
                 self._emit(
                     RuntimeEvent.info(
                         "LLMRuntime",
@@ -726,6 +747,7 @@ class LLMRuntime:
                         **_usage_metadata(response.usage),
                     },
                 )
+            self._emit_tool_call_events(response)
             self._emit_completed(response)
             return response
 
@@ -953,6 +975,41 @@ class LLMRuntime:
             )
         )
 
+    def _emit_tools_available(self, provider: str, request: LLMRequest) -> None:
+        if not request.tools:
+            return
+        self._emit(
+            RuntimeEvent.info(
+                "LLMRuntime",
+                "llm.tools_available",
+                f"LLM tools available for {provider}",
+                {
+                    "provider": provider,
+                    "model": request.model,
+                    "tool_count": len(request.tools),
+                },
+            )
+        )
+
+    def _emit_tool_call_events(self, response: LLMResponse) -> None:
+        if not response.tool_calls:
+            return
+        tool_call_count = len(response.tool_calls)
+        for tool_call in response.tool_calls:
+            self._emit(
+                RuntimeEvent.info(
+                    "LLMRuntime",
+                    "llm.tool_call_requested",
+                    f"LLM requested tool call: {tool_call.name}",
+                    {
+                        "provider": response.provider,
+                        "model": response.model,
+                        "tool_name": tool_call.name,
+                        "tool_call_count": tool_call_count,
+                    },
+                )
+            )
+
     def _handle_budget_exceeded(self, exceeded: tuple[str, ...]) -> None:
         if not exceeded:
             return
@@ -1142,6 +1199,21 @@ def _coerce_message(message: MessageInput) -> LLMMessage:
             metadata=dict(message.get("metadata", {})),
         )
     raise TypeError("messages must be LLMMessage objects or mappings")
+
+
+def _coerce_tool_definition(tool: ToolInput) -> LLMToolDefinition:
+    if isinstance(tool, LLMToolDefinition):
+        return tool
+    if isinstance(tool, Mapping):
+        parameters_schema = tool.get("parameters_schema", tool.get("parameters", {}))
+        if not isinstance(parameters_schema, Mapping):
+            raise TypeError("tool parameters_schema must be a mapping")
+        return LLMToolDefinition(
+            name=str(tool.get("name", "")),
+            description=str(tool.get("description", "")),
+            parameters_schema=dict(parameters_schema),
+        )
+    raise TypeError("tools must be LLMToolDefinition objects or mappings")
 
 
 def _provider_name(provider: LLMProvider) -> str:

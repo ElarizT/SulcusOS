@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import os
+import json
+from copy import deepcopy
 from collections.abc import Mapping
 from typing import Any
 
 from kernel.llm.providers import LLMProviderError, classify_llm_error
-from kernel.llm.types import LLMRequest, LLMResponse, LLMUsage
+from kernel.llm.types import LLMRequest, LLMResponse, LLMToolCall, LLMUsage
 
 
 class OpenAICompatibleProvider:
@@ -111,7 +113,27 @@ def _request_payload(request: LLMRequest) -> dict[str, Any]:
         payload["max_tokens"] = max_tokens
     if request.timeout_seconds is not None:
         payload["timeout"] = request.timeout_seconds
+    if request.tools:
+        payload["tools"] = [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": deepcopy(tool.parameters_schema),
+                },
+            }
+            for tool in request.tools
+        ]
+    if request.tool_choice is not None:
+        payload["tool_choice"] = _map_tool_choice(request.tool_choice)
     return payload
+
+
+def _map_tool_choice(tool_choice: str | Mapping[str, Any]) -> str | dict[str, Any]:
+    if isinstance(tool_choice, str):
+        return tool_choice
+    return deepcopy(dict(tool_choice))
 
 
 def _safe_max_tokens(metadata: Mapping[str, Any]) -> int | None:
@@ -148,12 +170,18 @@ def _response_from_completion(
 
         usage = _map_usage(getattr(completion, "usage", None))
         metadata = _safe_response_metadata(completion)
+        tool_calls = _map_tool_calls(
+            getattr(choices[0].message, "tool_calls", None),
+            provider=provider,
+            model=model,
+        )
         return LLMResponse(
             content=content,
             model=model,
             provider=provider,
             usage=usage,
             metadata=metadata,
+            tool_calls=tool_calls,
         )
     except LLMProviderError:
         raise
@@ -182,6 +210,73 @@ def _optional_nonnegative_int(value: Any, attribute: str) -> int | None:
             "OpenAI-compatible provider returned malformed usage data"
         )
     return token_count
+
+
+def _map_tool_calls(
+    raw_tool_calls: Any,
+    *,
+    provider: str,
+    model: str,
+) -> tuple[LLMToolCall, ...]:
+    if raw_tool_calls is None:
+        return ()
+    if isinstance(raw_tool_calls, (str, bytes)):
+        raise LLMProviderError(
+            "OpenAI-compatible provider returned malformed tool call data"
+        )
+    mapped: list[LLMToolCall] = []
+    for index, raw_tool_call in enumerate(raw_tool_calls):
+        tool_call_id = _field(raw_tool_call, "id")
+        function = _field(raw_tool_call, "function")
+        name = _field(function, "name") if function is not None else None
+        arguments = _field(function, "arguments") if function is not None else None
+        if not isinstance(tool_call_id, str) or not tool_call_id.strip():
+            raise LLMProviderError(
+                "OpenAI-compatible provider returned malformed tool call data"
+            )
+        if not isinstance(name, str) or not name.strip():
+            raise LLMProviderError(
+                "OpenAI-compatible provider returned malformed tool call data"
+            )
+        mapped.append(
+            LLMToolCall(
+                id=tool_call_id,
+                name=name,
+                arguments=_parse_tool_arguments(arguments),
+                provider=provider,
+                model=model,
+                metadata={"index": index},
+            )
+        )
+    return tuple(mapped)
+
+
+def _field(value: Any, name: str) -> Any:
+    if isinstance(value, Mapping):
+        return value.get(name)
+    return getattr(value, name, None)
+
+
+def _parse_tool_arguments(arguments: Any) -> dict[str, Any]:
+    if arguments is None or arguments == "":
+        return {}
+    if isinstance(arguments, Mapping):
+        return deepcopy(dict(arguments))
+    if not isinstance(arguments, str):
+        raise LLMProviderError(
+            "OpenAI-compatible provider returned malformed tool call arguments"
+        )
+    try:
+        parsed = json.loads(arguments)
+    except json.JSONDecodeError:
+        raise LLMProviderError(
+            "OpenAI-compatible provider returned malformed tool call arguments"
+        ) from None
+    if not isinstance(parsed, Mapping):
+        raise LLMProviderError(
+            "OpenAI-compatible provider returned malformed tool call arguments"
+        )
+    return deepcopy(dict(parsed))
 
 
 def _safe_response_metadata(completion: Any) -> dict[str, Any]:

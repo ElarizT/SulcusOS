@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
+from collections.abc import Mapping
 from typing import Any
 
 
@@ -99,6 +101,103 @@ class LLMUsage:
 
 
 @dataclass(frozen=True)
+class LLMToolParameter:
+    """Provider-neutral description of one tool parameter."""
+
+    name: str
+    type: str
+    description: str = ""
+    required: bool = False
+    enum: tuple[Any, ...] | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("LLM tool parameter name must not be empty")
+        if not isinstance(self.type, str) or not self.type.strip():
+            raise ValueError("LLM tool parameter type must not be empty")
+        if not isinstance(self.description, str):
+            raise ValueError("LLM tool parameter description must be a string")
+        if not isinstance(self.required, bool):
+            raise ValueError("LLM tool parameter required must be a boolean")
+        if self.enum is not None:
+            if isinstance(self.enum, (str, bytes)):
+                raise ValueError("LLM tool parameter enum must be a sequence")
+            try:
+                object.__setattr__(self, "enum", tuple(self.enum))
+            except TypeError:
+                raise ValueError("LLM tool parameter enum must be a sequence") from None
+        object.__setattr__(self, "metadata", dict(self.metadata))
+
+
+@dataclass(frozen=True)
+class LLMToolDefinition:
+    """Provider-neutral structured tool definition exposed to an LLM."""
+
+    name: str
+    description: str
+    parameters_schema: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("LLM tool name must not be empty")
+        if not isinstance(self.description, str):
+            raise ValueError("LLM tool description must be a string")
+        if not isinstance(self.parameters_schema, Mapping):
+            raise ValueError("LLM tool parameters_schema must be a mapping")
+        object.__setattr__(self, "parameters_schema", deepcopy(dict(self.parameters_schema)))
+
+
+@dataclass(frozen=True)
+class LLMToolCall:
+    """Provider-neutral structured tool-call request returned by an LLM."""
+
+    id: str
+    name: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+    provider: str = ""
+    model: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.id, str) or not self.id.strip():
+            raise ValueError("LLM tool call id must not be empty")
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("LLM tool call name must not be empty")
+        if not isinstance(self.arguments, Mapping):
+            raise ValueError("LLM tool call arguments must be a mapping")
+        for field_name in ("provider", "model"):
+            value = getattr(self, field_name)
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"LLM tool call {field_name} must be a string")
+        object.__setattr__(self, "arguments", deepcopy(dict(self.arguments)))
+        object.__setattr__(self, "metadata", dict(self.metadata))
+
+
+@dataclass(frozen=True)
+class LLMToolResult:
+    """Provider-neutral result shape for future explicit tool execution."""
+
+    tool_call_id: str
+    name: str
+    content: str
+    success: bool = True
+    error: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.tool_call_id, str) or not self.tool_call_id.strip():
+            raise ValueError("LLM tool result tool_call_id must not be empty")
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("LLM tool result name must not be empty")
+        if not isinstance(self.content, str):
+            raise ValueError("LLM tool result content must be a string")
+        if not isinstance(self.success, bool):
+            raise ValueError("LLM tool result success must be a boolean")
+        if self.error is not None and not isinstance(self.error, str):
+            raise ValueError("LLM tool result error must be a string")
+
+
+@dataclass(frozen=True)
 class LLMUsageLedger:
     """Cumulative provider-reported token usage."""
 
@@ -164,14 +263,28 @@ class LLMRequest:
     temperature: float = 0.0
     metadata: dict[str, Any] = field(default_factory=dict)
     timeout_seconds: float | None = None
+    tools: tuple[LLMToolDefinition, ...] = ()
+    tool_choice: str | dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "messages", tuple(self.messages))
         object.__setattr__(self, "metadata", dict(self.metadata))
+        object.__setattr__(self, "tools", tuple(self.tools))
         if not self.messages:
             raise ValueError("LLM request must contain at least one message")
         if not self.model.strip():
             raise ValueError("LLM request model must not be empty")
+        for tool in self.tools:
+            if not isinstance(tool, LLMToolDefinition):
+                raise ValueError("LLM request tools must be LLMToolDefinition objects")
+        if self.tool_choice is not None:
+            if isinstance(self.tool_choice, str):
+                if not self.tool_choice.strip():
+                    raise ValueError("LLM request tool_choice must not be empty")
+            elif isinstance(self.tool_choice, Mapping):
+                object.__setattr__(self, "tool_choice", deepcopy(dict(self.tool_choice)))
+            else:
+                raise ValueError("LLM request tool_choice must be a string or mapping")
         if self.timeout_seconds is not None:
             if isinstance(self.timeout_seconds, bool) or not isinstance(
                 self.timeout_seconds, (int, float)
@@ -188,13 +301,18 @@ class LLMResponse:
     provider: str
     usage: LLMUsage | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    tool_calls: tuple[LLMToolCall, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "metadata", dict(self.metadata))
+        object.__setattr__(self, "tool_calls", tuple(self.tool_calls))
         if not self.model.strip():
             raise ValueError("LLM response model must not be empty")
         if not self.provider.strip():
             raise ValueError("LLM response provider must not be empty")
+        for tool_call in self.tool_calls:
+            if not isinstance(tool_call, LLMToolCall):
+                raise ValueError("LLM response tool_calls must be LLMToolCall objects")
 
 
 @dataclass(frozen=True)

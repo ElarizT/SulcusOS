@@ -107,6 +107,15 @@ def build_llm_cache_key(request: LLMRequest, provider_name: str) -> LLMCacheKey:
         "options": {
             "max_tokens": _canonical_value(_request_option(request.metadata, "max_tokens"))
         },
+        "tools": [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters_schema": _canonical_value(tool.parameters_schema),
+            }
+            for tool in request.tools
+        ],
+        "tool_choice": _canonical_value(request.tool_choice),
     }
     serialized = json.dumps(
         payload,
@@ -129,6 +138,7 @@ def copy_llm_response(
         provider=response.provider,
         usage=response.usage,
         metadata=deepcopy(dict(response.metadata if metadata is None else metadata)),
+        tool_calls=response.tool_calls,
     )
 
 
@@ -147,6 +157,13 @@ def _canonical_value(value: Any) -> Any:
         if math.isfinite(value):
             return value
         return {"type": "float", "value": str(value)}
+    if isinstance(value, Mapping):
+        return {
+            str(key): _canonical_value(child)
+            for key, child in sorted(value.items(), key=lambda item: str(item[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonical_value(child) for child in value]
     return {
         "type": f"{value.__class__.__module__}.{value.__class__.__qualname__}",
     }

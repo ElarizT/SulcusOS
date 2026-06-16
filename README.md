@@ -374,3 +374,38 @@ runtime = LLMRuntime(
 response = runtime.chat(messages=[...])
 costs = runtime.cost_snapshot()
 ```
+
+Step 33 adds provider-neutral LLM tool-calling support. Agents can describe
+safe callable tools structurally with `LLMToolDefinition` and
+`parameters_schema`; providers that support tool calling map those definitions
+into their native schema and map returned tool-call requests back into neutral
+`LLMToolCall` objects on `LLMResponse.tool_calls`.
+
+```python
+from kernel.llm import LLMRuntime, LLMToolDefinition
+
+tool = LLMToolDefinition(
+    name="get_weather",
+    description="Get weather for a city.",
+    parameters_schema={
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"],
+    },
+)
+
+response = runtime.chat(
+    messages=[{"role": "user", "content": "Check Warsaw weather"}],
+    tools=[tool],
+    tool_choice="auto",
+)
+
+for tool_call in response.tool_calls:
+    print(tool_call.name, tool_call.arguments)
+```
+
+Tool calls are returned but not executed automatically in Step 33. Tool
+execution will be a future runtime feature. Runtime events only expose safe
+metadata such as provider, model, tool counts, and tool names; prompts, tool
+arguments, API keys, headers, and raw provider responses are not logged by
+default.
