@@ -37,6 +37,19 @@ def classify_llm_error(error: Exception) -> str:
     if isinstance(category, str) and category:
         return category
 
+    status_code = _error_status_code(error)
+    if status_code is not None:
+        if status_code in {408, 504}:
+            return "timeout"
+        if status_code == 429:
+            return "rate_limit"
+        if status_code in {401, 403}:
+            return "configuration"
+        if 400 <= status_code < 500:
+            return "request"
+        if 500 <= status_code < 600:
+            return "transient"
+
     error_name = error.__class__.__name__.lower()
     if isinstance(error, TimeoutError) or "timeout" in error_name:
         return "timeout"
@@ -44,9 +57,29 @@ def classify_llm_error(error: Exception) -> str:
         return "rate_limit"
     if isinstance(error, ImportError) or any(
         marker in error_name
-        for marker in ("authentication", "configuration", "dependency")
+        for marker in (
+            "authentication",
+            "configuration",
+            "dependency",
+            "permission",
+            "unauthorized",
+        )
     ):
         return "configuration"
+    if any(
+        marker in error_name
+        for marker in (
+            "badrequest",
+            "notfound",
+            "not_found",
+            "invalidrequest",
+            "invalid_request",
+            "invalid",
+            "unprocessable",
+            "unsupported",
+        )
+    ):
+        return "request"
     if isinstance(error, ConnectionError) or any(
         marker in error_name for marker in ("connection", "temporary", "transient")
     ):
@@ -54,6 +87,18 @@ def classify_llm_error(error: Exception) -> str:
     if isinstance(error, LLMProviderError):
         return "provider"
     return "unknown"
+
+
+def _error_status_code(error: Exception) -> int | None:
+    for value in (
+        getattr(error, "status_code", None),
+        getattr(getattr(error, "response", None), "status_code", None),
+    ):
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int) and value > 0:
+            return value
+    return None
 
 
 @runtime_checkable

@@ -253,8 +253,20 @@ def test_error_classification_is_deterministic() -> None:
     class RateLimitError(Exception):
         pass
 
+    class BadRequestError(Exception):
+        pass
+
+    class APIStatusError(Exception):
+        status_code = 400
+
+    class ServerStatusError(Exception):
+        status_code = 503
+
     assert classify_llm_error(TimeoutError()) == "timeout"
     assert classify_llm_error(RateLimitError()) == "rate_limit"
+    assert classify_llm_error(BadRequestError()) == "request"
+    assert classify_llm_error(APIStatusError()) == "request"
+    assert classify_llm_error(ServerStatusError()) == "transient"
     assert classify_llm_error(ConnectionError()) == "transient"
     assert (
         classify_llm_error(LLMProviderError("safe", category="configuration"))

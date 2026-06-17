@@ -116,6 +116,7 @@ def test_runtime_chat_failure_is_safe_and_emits_failure_event() -> None:
         "model": "test-model",
         "error": True,
         "error_type": "ValueError",
+        "error_category": "unknown",
     }
     assert secret not in repr(events.events)
 

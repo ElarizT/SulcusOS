@@ -14,6 +14,7 @@ from kernel.llm import (
     LLMRequest,
     LLMResponse,
     LLMRuntime,
+    LLMToolCall,
     LLMUsage,
     OpenAICompatibleProvider,
 )
@@ -36,6 +37,42 @@ def fake_client(response: Any = None, error: Exception | None = None) -> Any:
     return SimpleNamespace(
         chat=SimpleNamespace(completions=FakeCompletions(response, error))
     )
+
+
+class FakeHTTPResponse:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = payload
+
+    def raise_for_status(self) -> None:
+        pass
+
+    def json(self) -> dict[str, Any]:
+        return self.payload
+
+
+class FakeHTTPClient:
+    instances: list["FakeHTTPClient"] = []
+
+    def __init__(self, **options: Any) -> None:
+        self.options = options
+        self.posts: list[dict[str, Any]] = []
+        FakeHTTPClient.instances.append(self)
+
+    def post(self, path: str, **kwargs: Any) -> FakeHTTPResponse:
+        self.posts.append({"path": path, **kwargs})
+        return FakeHTTPResponse(
+            {
+                "id": "chatcmpl-http-id",
+                "created": 67890,
+                "model": "http-model",
+                "choices": [{"message": {"content": "http response"}}],
+                "usage": {
+                    "prompt_tokens": 3,
+                    "completion_tokens": 2,
+                    "total_tokens": 5,
+                },
+            }
+        )
 
 
 def fake_response(
@@ -104,7 +141,7 @@ def test_missing_api_key_is_reported_only_when_provider_is_used(
         provider.complete(LLMRequest((LLMMessage("user", "private"),), "test-model"))
 
 
-def test_missing_openai_dependency_has_clear_safe_error(
+def test_missing_openai_dependency_uses_http_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     original_import = builtins.__import__
@@ -115,13 +152,33 @@ def test_missing_openai_dependency_has_clear_safe_error(
         return original_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", missing_openai)
-    provider = OpenAICompatibleProvider(api_key="placeholder-key")
+    import httpx
 
-    with pytest.raises(LLMProviderError, match="optional 'openai' package") as error:
-        provider.complete(LLMRequest((LLMMessage("user", "private"),), "test-model"))
+    FakeHTTPClient.instances.clear()
+    monkeypatch.setattr(httpx, "Client", FakeHTTPClient)
+    provider = OpenAICompatibleProvider(
+        api_key="placeholder-key",
+        base_url="https://api.example/v1",
+    )
+    response = provider.complete(
+        LLMRequest((LLMMessage("user", "private"),), "test-model", timeout_seconds=5)
+    )
 
-    assert error.value.__cause__ is None
-    assert "placeholder-key" not in repr(error.value)
+    assert response.content == "http response"
+    assert response.model == "http-model"
+    assert response.usage == LLMUsage(prompt_tokens=3, completion_tokens=2, total_tokens=5)
+    assert FakeHTTPClient.instances[0].options["base_url"] == "https://api.example/v1/"
+    assert FakeHTTPClient.instances[0].posts == [
+        {
+            "path": "chat/completions",
+            "json": {
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "private"}],
+                "temperature": 0.0,
+            },
+            "timeout": 5,
+        }
+    ]
 
 
 def test_request_response_and_usage_mapping() -> None:
@@ -168,6 +225,53 @@ def test_request_response_and_usage_mapping() -> None:
             "system_fingerprint": "fp_safe",
         },
     )
+
+
+def test_tool_feedback_messages_map_to_openai_compatible_payload() -> None:
+    client = fake_client(fake_response(content="final"))
+    provider = OpenAICompatibleProvider(
+        api_key="placeholder-key",
+        provider_name="openai",
+        client=client,
+    )
+    tool_call = LLMToolCall(
+        id="call_1",
+        name="add_numbers",
+        arguments={"a": 15, "b": 27},
+    )
+    request = LLMRequest(
+        (
+            LLMMessage("user", "private prompt"),
+            LLMMessage("assistant", "", {"tool_calls": (tool_call,)}),
+            LLMMessage(
+                "tool",
+                "42",
+                {"tool_call_id": "call_1", "name": "add_numbers"},
+            ),
+        ),
+        "requested-model",
+    )
+
+    provider.complete(request)
+
+    assert client.chat.completions.calls[0]["messages"] == [
+        {"role": "user", "content": "private prompt"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "add_numbers",
+                        "arguments": '{"a":15,"b":27}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "content": "42", "tool_call_id": "call_1"},
+    ]
 
 
 def test_provider_failure_is_wrapped_without_leaking_sensitive_text() -> None:
@@ -254,4 +358,5 @@ def test_runtime_failure_does_not_leak_provider_key_or_prompt() -> None:
         "model": "test-model",
         "error": True,
         "error_type": "LLMProviderError",
+        "error_category": "unknown",
     }

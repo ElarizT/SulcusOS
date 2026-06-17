@@ -447,3 +447,38 @@ error category; argument values, stack traces, prompts, API keys, and raw
 exceptions are not logged by default. Timeout fields are part of the API, with
 the current dependency-free implementation checking elapsed synchronous runtime
 after the callable returns rather than interrupting Python execution mid-call.
+
+Step 35 adds a safe Agent Tool Loop for bounded LLM-tool orchestration.
+`LLMRuntime.chat` still does not execute tools automatically; callers must
+explicitly create and invoke `AgentToolLoop`. The loop sends tool definitions to
+the LLM, detects returned tool calls, executes only registered `ToolRuntime`
+tools, feeds sanitized tool results back to the LLM, and stops at a final
+response, a pending approval point, a tool error, or `max_steps`.
+
+```python
+from kernel.agent_tool_loop import AgentToolLoop
+
+loop = AgentToolLoop(
+    llm_runtime=llm_runtime,
+    tool_runtime=tool_runtime,
+)
+
+result = loop.run(
+    messages=[
+        {"role": "user", "content": "Calculate 15 + 27 using tools."}
+    ],
+    tools=[add_numbers_tool],
+    max_steps=4,
+)
+
+print(result.final_response.content)
+```
+
+The default loop configuration is conservative and deterministic:
+`max_steps=4`, no parallel tool execution, stop on tool errors, and intermediate
+steps included in the structured result. Approval mode
+(`require_tool_approval=True`) returns pending tool calls without executing
+them, ready for a future UI approval flow. Safe `RuntimeEvent`s expose only
+metadata such as step index, provider/model, tool names, tool counts, success
+markers, and error categories; prompts, argument values, API keys, headers, raw
+provider responses, and stack traces are not logged by default.

@@ -100,7 +100,11 @@ def build_llm_cache_key(request: LLMRequest, provider_name: str) -> LLMCacheKey:
         "provider": normalized_provider,
         "model": request.model,
         "messages": [
-            {"role": message.role, "content": message.content}
+            {
+                "role": message.role,
+                "content": message.content,
+                "protocol": _message_protocol_metadata(message),
+            }
             for message in request.messages
         ],
         "temperature": _canonical_value(request.temperature),
@@ -140,6 +144,46 @@ def copy_llm_response(
         metadata=deepcopy(dict(response.metadata if metadata is None else metadata)),
         tool_calls=response.tool_calls,
     )
+
+
+def _message_protocol_metadata(message: Any) -> dict[str, Any]:
+    metadata = getattr(message, "metadata", {})
+    if not isinstance(metadata, Mapping):
+        return {}
+
+    protocol: dict[str, Any] = {}
+    tool_call_id = metadata.get("tool_call_id")
+    if isinstance(tool_call_id, str) and tool_call_id:
+        protocol["tool_call_id"] = tool_call_id
+
+    tool_calls = metadata.get("tool_calls")
+    if tool_calls is not None and not isinstance(tool_calls, (str, bytes)):
+        try:
+            protocol["tool_calls"] = [
+                _tool_call_protocol_metadata(tool_call) for tool_call in tool_calls
+            ]
+        except TypeError:
+            pass
+    return protocol
+
+
+def _tool_call_protocol_metadata(tool_call: Any) -> dict[str, Any]:
+    if isinstance(tool_call, Mapping):
+        tool_call_id = tool_call.get("id")
+        name = tool_call.get("name")
+        arguments = tool_call.get("arguments")
+    else:
+        tool_call_id = getattr(tool_call, "id", None)
+        name = getattr(tool_call, "name", None)
+        arguments = getattr(tool_call, "arguments", None)
+    protocol: dict[str, Any] = {}
+    if isinstance(tool_call_id, str) and tool_call_id:
+        protocol["id"] = tool_call_id
+    if isinstance(name, str) and name:
+        protocol["name"] = name
+    if isinstance(arguments, Mapping):
+        protocol["arguments"] = _canonical_value(arguments)
+    return protocol
 
 
 def _request_option(metadata: Mapping[str, Any], name: str) -> Any:

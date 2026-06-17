@@ -573,6 +573,7 @@ class LLMRuntime:
                 request=request,
             )
         except Exception as exc:
+            category = classify_llm_error(exc)
             self._emit(
                 RuntimeEvent.error(
                     "LLMRuntime",
@@ -582,12 +583,16 @@ class LLMRuntime:
                         **event_metadata,
                         "error": True,
                         "error_type": exc.__class__.__name__,
+                        "error_category": category,
                     },
                 )
             )
             if isinstance(exc, LLMProviderError):
                 raise
-            raise LLMProviderError(f"LLM provider '{provider_name}' failed") from exc
+            raise LLMProviderError(
+                f"LLM provider '{provider_name}' failed",
+                category=category,
+            ) from exc
 
         self._record_cost(response.provider, response.model, response.usage)
         self._apply_response_usage(response)
@@ -724,11 +729,13 @@ class LLMRuntime:
                             "model": request.model,
                             "error": True,
                             "error_type": exc.__class__.__name__,
+                            "error_category": category,
                         },
                     )
                 )
                 raise LLMProviderError(
-                    f"LLM provider '{provider_name}' failed"
+                    f"LLM provider '{provider_name}' failed",
+                    category=category,
                 ) from None
 
             self._record_cost(response.provider, response.model, response.usage)

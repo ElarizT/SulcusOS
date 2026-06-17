@@ -1,4 +1,4 @@
-"""Optional synchronous provider for OpenAI-compatible chat completion APIs."""
+"""Synchronous provider for OpenAI-compatible chat completion APIs."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from kernel.llm.providers import LLMProviderError, classify_llm_error
-from kernel.llm.types import LLMRequest, LLMResponse, LLMToolCall, LLMUsage
+from kernel.llm.types import LLMMessage, LLMRequest, LLMResponse, LLMToolCall, LLMUsage
 
 
 class OpenAICompatibleProvider:
@@ -71,10 +71,12 @@ class OpenAICompatibleProvider:
         try:
             from openai import OpenAI
         except (ImportError, ModuleNotFoundError):
-            raise LLMProviderError(
-                "OpenAI-compatible provider requires the optional 'openai' package",
-                category="configuration",
-            ) from None
+            self._client = _HTTPCompatibleClient(
+                api_key=self.api_key or "",
+                base_url=self.base_url or "https://api.openai.com/v1",
+                timeout_seconds=self.timeout_seconds,
+            )
+            return self._client
 
         client_options: dict[str, Any] = {
             "api_key": self.api_key,
@@ -92,6 +94,51 @@ class OpenAICompatibleProvider:
         return self._client
 
 
+class _HTTPCompatibleClient:
+    """Tiny OpenAI-compatible chat client used when the official SDK is unavailable."""
+
+    def __init__(self, *, api_key: str, base_url: str, timeout_seconds: float) -> None:
+        try:
+            import httpx
+        except (ImportError, ModuleNotFoundError):
+            raise LLMProviderError(
+                "OpenAI-compatible provider requires either 'openai' or 'httpx'",
+                category="configuration",
+            ) from None
+
+        self.chat = _HTTPChat(
+            httpx.Client(
+                base_url=base_url.rstrip("/") + "/",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=timeout_seconds,
+            )
+        )
+
+
+class _HTTPChat:
+    def __init__(self, client: Any) -> None:
+        self.completions = _HTTPCompletions(client)
+
+
+class _HTTPCompletions:
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    def create(self, **payload: Any) -> dict[str, Any]:
+        request_payload = dict(payload)
+        timeout = request_payload.pop("timeout", None)
+        response = self._client.post(
+            "chat/completions",
+            json=request_payload,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        return response.json()
+
+
 def _configured_value(explicit: str | None, environment_name: str) -> str | None:
     value = explicit if explicit is not None else os.getenv(environment_name)
     if value is None:
@@ -102,10 +149,7 @@ def _configured_value(explicit: str | None, environment_name: str) -> str | None
 def _request_payload(request: LLMRequest) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model": request.model,
-        "messages": [
-            {"role": message.role, "content": message.content}
-            for message in request.messages
-        ],
+        "messages": [_message_payload(message) for message in request.messages],
         "temperature": request.temperature,
     }
     max_tokens = _safe_max_tokens(request.metadata)
@@ -128,6 +172,69 @@ def _request_payload(request: LLMRequest) -> dict[str, Any]:
     if request.tool_choice is not None:
         payload["tool_choice"] = _map_tool_choice(request.tool_choice)
     return payload
+
+
+def _message_payload(message: LLMMessage) -> dict[str, Any]:
+    payload: dict[str, Any] = {"role": message.role, "content": message.content}
+    tool_calls = message.metadata.get("tool_calls")
+    if tool_calls is not None:
+        payload["tool_calls"] = _map_message_tool_calls(tool_calls)
+    if message.role == "tool":
+        tool_call_id = message.metadata.get("tool_call_id")
+        if not isinstance(tool_call_id, str) or not tool_call_id.strip():
+            raise LLMProviderError("OpenAI-compatible tool messages require tool_call_id")
+        payload["tool_call_id"] = tool_call_id
+    return payload
+
+
+def _map_message_tool_calls(tool_calls: Any) -> list[dict[str, Any]]:
+    if isinstance(tool_calls, (str, bytes)):
+        raise LLMProviderError("OpenAI-compatible message tool_calls must be a sequence")
+    try:
+        iterable = list(tool_calls)
+    except TypeError:
+        raise LLMProviderError(
+            "OpenAI-compatible message tool_calls must be a sequence"
+        ) from None
+
+    mapped: list[dict[str, Any]] = []
+    for tool_call in iterable:
+        if isinstance(tool_call, LLMToolCall):
+            tool_call_id = tool_call.id
+            name = tool_call.name
+            arguments = tool_call.arguments
+        elif isinstance(tool_call, Mapping):
+            tool_call_id = tool_call.get("id")
+            name = tool_call.get("name")
+            arguments = tool_call.get("arguments", {})
+        else:
+            raise LLMProviderError(
+                "OpenAI-compatible message tool_calls must contain LLMToolCall objects"
+            )
+        if not isinstance(tool_call_id, str) or not tool_call_id.strip():
+            raise LLMProviderError("OpenAI-compatible message tool_call id is invalid")
+        if not isinstance(name, str) or not name.strip():
+            raise LLMProviderError("OpenAI-compatible message tool_call name is invalid")
+        if not isinstance(arguments, Mapping):
+            raise LLMProviderError(
+                "OpenAI-compatible message tool_call arguments must be a mapping"
+            )
+        mapped.append(
+            {
+                "id": tool_call_id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(
+                        deepcopy(dict(arguments)),
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                },
+            }
+        )
+    return mapped
 
 
 def _map_tool_choice(tool_choice: str | Mapping[str, Any]) -> str | dict[str, Any]:
@@ -155,23 +262,24 @@ def _response_from_completion(
     request: LLMRequest,
 ) -> LLMResponse:
     try:
-        choices = completion.choices
+        choices = _field(completion, "choices")
         if not choices:
             raise ValueError
-        content = choices[0].message.content
+        message = _field(choices[0], "message")
+        content = _field(message, "content")
         if content is None:
             content = ""
         if not isinstance(content, str):
             raise TypeError
 
-        model = getattr(completion, "model", None) or request.model
+        model = _field(completion, "model") or request.model
         if not isinstance(model, str) or not model.strip():
             raise TypeError
 
-        usage = _map_usage(getattr(completion, "usage", None))
+        usage = _map_usage(_field(completion, "usage"))
         metadata = _safe_response_metadata(completion)
         tool_calls = _map_tool_calls(
-            getattr(choices[0].message, "tool_calls", None),
+            _field(message, "tool_calls"),
             provider=provider,
             model=model,
         )
@@ -202,7 +310,7 @@ def _map_usage(usage: Any) -> LLMUsage | None:
 
 
 def _optional_nonnegative_int(value: Any, attribute: str) -> int | None:
-    token_count = getattr(value, attribute, None)
+    token_count = _field(value, attribute)
     if token_count is None:
         return None
     if isinstance(token_count, bool) or not isinstance(token_count, int) or token_count < 0:
@@ -281,13 +389,13 @@ def _parse_tool_arguments(arguments: Any) -> dict[str, Any]:
 
 def _safe_response_metadata(completion: Any) -> dict[str, Any]:
     metadata: dict[str, Any] = {}
-    response_id = getattr(completion, "id", None)
+    response_id = _field(completion, "id")
     if isinstance(response_id, str) and response_id:
         metadata["response_id"] = response_id
-    created = getattr(completion, "created", None)
+    created = _field(completion, "created")
     if isinstance(created, int) and not isinstance(created, bool):
         metadata["created"] = created
-    system_fingerprint = getattr(completion, "system_fingerprint", None)
+    system_fingerprint = _field(completion, "system_fingerprint")
     if isinstance(system_fingerprint, str) and system_fingerprint:
         metadata["system_fingerprint"] = system_fingerprint
     return metadata
