@@ -409,3 +409,41 @@ execution will be a future runtime feature. Runtime events only expose safe
 metadata such as provider, model, tool counts, and tool names; prompts, tool
 arguments, API keys, headers, and raw provider responses are not logged by
 default.
+
+Step 34 adds a safe Tool Execution Runtime for registered tools. Tools must be
+explicitly registered with `ToolRegistry`; Agent OS does not import tools by
+name, provide shell/network/file tools by default, or automatically execute LLM
+tool calls from `LLMRuntime.chat`. Execution is explicit through `ToolRuntime`,
+which validates required fields and basic JSON-schema-like types before calling
+the approved callable.
+
+```python
+from kernel.tools import ToolRegistry, ToolRuntime
+
+registry = ToolRegistry()
+
+registry.register(
+    name="add_numbers",
+    description="Add two numbers.",
+    parameters_schema={
+        "type": "object",
+        "properties": {
+            "a": {"type": "number"},
+            "b": {"type": "number"},
+        },
+        "required": ["a", "b"],
+    },
+    func=lambda a, b: a + b,
+)
+
+runtime = ToolRuntime(registry=registry)
+result = runtime.execute("add_numbers", {"a": 2, "b": 3})
+```
+
+`ToolRuntime` can also execute a Step 33 `LLMToolCall` explicitly and convert
+`ToolExecutionResult` back to `LLMToolResult` for future agent tool loops. Tool
+events contain safe metadata such as tool name, argument keys, duration, and
+error category; argument values, stack traces, prompts, API keys, and raw
+exceptions are not logged by default. Timeout fields are part of the API, with
+the current dependency-free implementation checking elapsed synchronous runtime
+after the callable returns rather than interrupting Python execution mid-call.
