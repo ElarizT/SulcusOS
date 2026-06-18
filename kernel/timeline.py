@@ -10,8 +10,30 @@ from typing import Any
 from kernel.events import RuntimeEvent
 
 
-_SUBJECT_KEYS = ("agent", "name", "process", "child", "worker")
-_METADATA_KEYS = ("pid", "exit_code", "duration_ms", "page", "error")
+_SUBJECT_KEYS = (
+    "agent",
+    "agent_name",
+    "agent_id",
+    "tool_name",
+    "name",
+    "process",
+    "child",
+    "worker",
+)
+_METADATA_KEYS = (
+    "success",
+    "reason",
+    "tool_count",
+    "tool_call_count",
+    "tool_result_count",
+    "duration_ms",
+    "error_type",
+    "error_category",
+    "pid",
+    "exit_code",
+    "page",
+    "error",
+)
 
 
 def format_timeline_event(event: RuntimeEvent) -> str:

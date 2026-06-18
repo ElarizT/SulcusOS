@@ -80,6 +80,28 @@ def test_timeline_metadata_summary_includes_scalars_and_omits_nested_values() ->
     assert "nested" not in row
 
 
+def test_timeline_formats_agent_tool_loop_tool_events_clearly() -> None:
+    row = format_timeline_event(
+        event(
+            15,
+            "AgentToolLoop",
+            "tool_execution_completed",
+            "Tool execution completed",
+            {
+                "tool_name": "add_numbers",
+                "success": True,
+                "tool_call_id": "call_1",
+            },
+        )
+    )
+
+    assert "agent_tool_loop" in row
+    assert "add_numbers" in row
+    assert "tool_execution_completed" in row
+    assert "success=True" in row
+    assert "tool_call_id" not in row
+
+
 def test_timeline_safely_renders_legacy_strings_and_dictionaries() -> None:
     rows = render_runtime_timeline(
         [

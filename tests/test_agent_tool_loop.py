@@ -23,6 +23,30 @@ class ScriptedProvider:
         return self.responses.pop(0)
 
 
+class FailingProvider:
+    name = "failing-agent-llm"
+    default_model = "fake-model"
+
+    def __init__(self) -> None:
+        self.requests: list[LLMRequest] = []
+
+    def complete(self, request: LLMRequest) -> LLMResponse:
+        self.requests.append(request)
+        raise RuntimeError("provider failed")
+
+
+def event_types(events: RuntimeEventLog) -> list[str]:
+    return [event.event_type for event in events.events]
+
+
+def timeline_event_types(events: RuntimeEventLog) -> list[str]:
+    return [
+        event.event_type
+        for event in events.events
+        if not event.event_type.startswith(("agent_tool_loop.", "llm.", "tool."))
+    ]
+
+
 def add_schema() -> dict[str, object]:
     return {
         "type": "object",
@@ -151,6 +175,41 @@ def test_one_tool_call_then_final_response() -> None:
     assert result.tool_results[0].content == "42"
 
 
+def test_successful_one_tool_loop_emits_timeline_events() -> None:
+    events = RuntimeEventLog()
+    call = tool_call("call_1")
+    provider = ScriptedProvider([tool_response(call), final_response("42")])
+    loop = build_loop(provider, add_registry(), events)
+
+    result = loop.run(
+        [{"role": "user", "content": "Calculate 15 + 27 using tools."}],
+        tools=[add_tool_definition()],
+    )
+
+    assert result.completed is True
+    assert timeline_event_types(events) == [
+        "agent_tool_loop_started",
+        "llm_request_started",
+        "llm_response_received",
+        "tool_call_requested",
+        "tool_execution_started",
+        "tool_execution_completed",
+        "llm_final_request_started",
+        "llm_final_response_received",
+        "agent_tool_loop_completed",
+    ]
+    requested = events.by_type("tool_call_requested")[0]
+    assert requested.metadata["tool_call_id"] == "call_1"
+    assert requested.metadata["tool_name"] == "add_numbers"
+    assert requested.metadata["argument_keys"] == ("a", "b")
+    assert "15" not in repr(requested.metadata)
+    assert events.by_type("tool_execution_completed")[0].metadata["output_preview"] == "42"
+    completed = events.by_type("agent_tool_loop_completed")[0]
+    assert completed.metadata["completed"] is True
+    assert completed.metadata["reason"] == "completed"
+    assert completed.metadata["tool_result_count"] == 1
+
+
 def test_multiple_tool_calls_in_one_llm_response_then_final_response() -> None:
     executions: list[tuple[str, float, float]] = []
     registry = ToolRegistry()
@@ -221,6 +280,58 @@ def test_multiple_tool_calls_in_one_llm_response_then_final_response() -> None:
     assert provider.requests[1].messages[2].content == "42"
     assert provider.requests[1].messages[3].metadata["name"] == "multiply_numbers"
     assert provider.requests[1].messages[3].content == "54"
+
+
+def test_multi_tool_loop_emits_timeline_events_per_tool_call() -> None:
+    events = RuntimeEventLog()
+    registry = ToolRegistry()
+    registry.register(
+        name="add_numbers",
+        description="Add two numbers.",
+        parameters_schema=add_schema(),
+        func=lambda a, b: a + b,
+    )
+    registry.register(
+        name="multiply_numbers",
+        description="Multiply two numbers.",
+        parameters_schema=add_schema(),
+        func=lambda a, b: a * b,
+    )
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                tool_call("call_add", arguments={"a": 15, "b": 27}),
+                tool_call(
+                    "call_multiply",
+                    name="multiply_numbers",
+                    arguments={"a": 6, "b": 9},
+                ),
+            ),
+            final_response("The sum is 42 and the product is 54."),
+        ]
+    )
+    loop = build_loop(provider, registry, events)
+
+    result = loop.run(
+        [{"role": "user", "content": "Use both arithmetic tools."}],
+        tools=[add_tool_definition(), multiply_tool_definition()],
+    )
+
+    assert result.completed is True
+    assert [event.metadata["tool_name"] for event in events.by_type("tool_call_requested")] == [
+        "add_numbers",
+        "multiply_numbers",
+    ]
+    assert [
+        event.metadata["tool_name"] for event in events.by_type("tool_execution_started")
+    ] == ["add_numbers", "multiply_numbers"]
+    assert [
+        event.metadata["tool_name"] for event in events.by_type("tool_execution_completed")
+    ] == ["add_numbers", "multiply_numbers"]
+    assert [event.metadata["output_preview"] for event in events.by_type("tool_execution_completed")] == [
+        "42",
+        "54",
+    ]
 
 
 def test_multiple_sequential_tool_calls() -> None:
@@ -297,6 +408,31 @@ def test_tool_validation_error_stops_before_execution() -> None:
     assert len(provider.requests) == 1
     assert result.steps[-1].error_category == "validation"
     assert result.tool_results[0].error == "missing required argument: b"
+
+
+def test_tool_failure_emits_failed_timeline_events_without_changing_semantics() -> None:
+    events = RuntimeEventLog()
+    provider = ScriptedProvider(
+        [tool_response(tool_call("call_1", arguments={"a": 2}))]
+    )
+    loop = build_loop(provider, add_registry(), events)
+
+    result = loop.run(
+        [{"role": "user", "content": "private prompt"}],
+        tools=[add_tool_definition()],
+    )
+
+    assert result.completed is False
+    assert result.reason == "tool_error"
+    assert "tool_execution_failed" in event_types(events)
+    assert "agent_tool_loop_failed" in event_types(events)
+    failure = events.by_type("tool_execution_failed")[0]
+    assert failure.metadata["tool_call_id"] == "call_1"
+    assert failure.metadata["tool_name"] == "add_numbers"
+    assert failure.metadata["success"] is False
+    assert failure.metadata["error_type"] == "ToolValidationError"
+    assert failure.metadata["error_category"] == "validation"
+    assert "missing required argument: b" in failure.metadata["error_preview"]
 
 
 def test_stop_on_tool_error_true_does_not_execute_later_tool_calls() -> None:
@@ -390,6 +526,26 @@ def test_require_tool_approval_returns_pending_without_executing() -> None:
     assert executions == []
     assert len(provider.requests) == 1
     assert events.by_type("agent_tool_loop.approval_required")
+
+
+def test_llm_provider_failure_emits_failed_timeline_events() -> None:
+    events = RuntimeEventLog()
+    provider = FailingProvider()
+    loop = build_loop(provider, ToolRegistry(), events)  # type: ignore[arg-type]
+
+    result = loop.run([{"role": "user", "content": "hello"}], tools=[])
+
+    assert result.completed is False
+    assert result.reason == "llm_error"
+    assert timeline_event_types(events) == [
+        "agent_tool_loop_started",
+        "llm_request_started",
+        "agent_tool_loop_failed",
+    ]
+    failed = events.by_type("agent_tool_loop_failed")[0]
+    assert failed.metadata["completed"] is False
+    assert failed.metadata["reason"] == "llm_error"
+    assert failed.metadata["error_type"] == "LLMProviderError"
 
 
 def test_llm_runtime_chat_still_does_not_execute_tools() -> None:

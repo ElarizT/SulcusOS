@@ -6,9 +6,24 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from kernel.agent_tool_loop import AgentToolLoop
-from kernel.events import RuntimeEventLog
+from kernel.events import RuntimeEvent, RuntimeEventLog
 from kernel.llm import LLMRequest, LLMResponse, LLMRuntime, LLMToolCall
 from kernel.tools import ToolRegistry, ToolRuntime
+
+
+TIMELINE_EVENT_TYPES = {
+    "agent_tool_loop_started",
+    "llm_request_started",
+    "llm_response_received",
+    "tool_call_requested",
+    "tool_execution_started",
+    "tool_execution_completed",
+    "tool_execution_failed",
+    "llm_final_request_started",
+    "llm_final_response_received",
+    "agent_tool_loop_completed",
+    "agent_tool_loop_failed",
+}
 
 
 class ScriptedMultiToolProvider:
@@ -101,6 +116,19 @@ def assert_multi_tool_demo_result(result, provider: ScriptedMultiToolProvider) -
     assert follow_up_roles == ["user", "assistant", "tool", "tool"]
 
 
+def print_timeline(events: RuntimeEventLog) -> None:
+    print("\nTimeline:")
+    timeline_events = [
+        event
+        for event in events.events
+        if isinstance(event, RuntimeEvent) and event.event_type in TIMELINE_EVENT_TYPES
+    ]
+    for index, event in enumerate(timeline_events, start=1):
+        tool_name = event.metadata.get("tool_name")
+        suffix = f" {tool_name}" if isinstance(tool_name, str) else ""
+        print(f"{index}. {event.event_type}{suffix}")
+
+
 def main() -> None:
     events = RuntimeEventLog()
     provider = ScriptedMultiToolProvider()
@@ -141,6 +169,7 @@ def main() -> None:
     if result.final_response is not None:
         print("Final LLM response:")
         print(result.final_response.content)
+    print_timeline(events)
 
     try:
         assert_multi_tool_demo_result(result, provider)

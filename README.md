@@ -518,3 +518,40 @@ python examples/agent_tool_loop_multi_tool_demo.py
 That scripted demo verifies a single agent tool loop run can execute both
 `add_numbers` and `multiply_numbers`, feed both tool execution results back to
 the LLM, and produce a final LLM response containing both results.
+
+### Agent Tool Loop Timeline
+
+Step 37 adds structured runtime timeline events for the Agent Tool Loop. The
+timeline proves that Sulcus OS observed each phase of a loop run, not just the
+final answer: loop start, LLM request, LLM response, requested tool calls, tool
+execution, final LLM request, final LLM response, and loop completion or
+failure.
+
+Run the offline deterministic demo:
+
+```powershell
+python examples/agent_tool_loop_multi_tool_demo.py
+```
+
+The timeline section prints a sequence like:
+
+```text
+Timeline:
+1. agent_tool_loop_started
+2. llm_request_started
+3. llm_response_received
+4. tool_call_requested add_numbers
+5. tool_execution_started add_numbers
+6. tool_execution_completed add_numbers
+7. tool_call_requested multiply_numbers
+8. tool_execution_started multiply_numbers
+9. tool_execution_completed multiply_numbers
+10. llm_final_request_started
+11. llm_final_response_received
+12. agent_tool_loop_completed
+```
+
+These events matter because dashboard and demo users can inspect the verified
+flow as structured runtime history instead of inferring it from print output.
+Live provider smoke tests still require `AGENTOS_LLM_API_KEY`; deterministic
+timeline tests run offline without API keys or internet access.

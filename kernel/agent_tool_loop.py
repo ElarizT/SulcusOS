@@ -172,6 +172,20 @@ class AgentToolLoop:
         all_tool_results: list[LLMToolResult] = []
 
         self._emit(
+            "agent_tool_loop_started",
+            "Agent tool loop started",
+            {
+                "max_steps": config.max_steps,
+                "require_tool_approval": config.require_tool_approval,
+                "stop_on_tool_error": config.stop_on_tool_error,
+                "allow_parallel_tool_calls": config.allow_parallel_tool_calls,
+                "tool_count": len(tool_definitions),
+                "tool_names": tuple(tool.name for tool in tool_definitions),
+                **route_metadata,
+                **_agent_metadata(metadata),
+            },
+        )
+        self._emit(
             "agent_tool_loop.started",
             "Agent tool loop started",
             {
@@ -182,6 +196,41 @@ class AgentToolLoop:
         )
 
         for step_index in range(config.max_steps):
+            history_tool_results = tuple(
+                message for message in history if message.role == "tool"
+            )
+            if history_tool_results:
+                successful_tool_results = sum(
+                    1
+                    for message in history_tool_results
+                    if message.metadata.get("success") is True
+                )
+                self._emit(
+                    "llm_final_request_started",
+                    "Agent tool loop final LLM request started",
+                    {
+                        "step_index": step_index,
+                        "provider": route_metadata.get("provider"),
+                        "model": route_metadata.get("model"),
+                        "tool_result_count": len(history_tool_results),
+                        "successful_tool_result_count": successful_tool_results,
+                        "failed_tool_result_count": (
+                            len(history_tool_results) - successful_tool_results
+                        ),
+                    },
+                )
+            else:
+                self._emit(
+                    "llm_request_started",
+                    "Agent tool loop LLM request started",
+                    {
+                        "step_index": step_index,
+                        "provider": route_metadata.get("provider"),
+                        "model": route_metadata.get("model"),
+                        "message_count": len(history),
+                        "tool_names": tuple(tool.name for tool in tool_definitions),
+                    },
+                )
             self._emit(
                 "agent_tool_loop.llm_step_started",
                 "Agent tool loop LLM step started",
@@ -223,6 +272,22 @@ class AgentToolLoop:
                     provider=route_metadata.get("provider"),
                     model=route_metadata.get("model"),
                 )
+                self._emit(
+                    "agent_tool_loop_failed",
+                    "Agent tool loop failed",
+                    {
+                        "completed": False,
+                        "reason": "llm_error",
+                        "step_index": step_index,
+                        "error_type": exc.__class__.__name__,
+                        "error_category": error_category,
+                        **_safe_request_route_metadata(
+                            route_metadata.get("provider"),
+                            route_metadata.get("model"),
+                        ),
+                    },
+                    error=True,
+                )
                 return self._result(
                     completed=False,
                     reason="llm_error",
@@ -241,7 +306,43 @@ class AgentToolLoop:
             )
             steps.append(llm_step)
 
+            final_response_received = bool(history_tool_results) and not response.tool_calls
+            self._emit(
+                (
+                    "llm_final_response_received"
+                    if final_response_received
+                    else "llm_response_received"
+                ),
+                (
+                    "Agent tool loop final LLM response received"
+                    if final_response_received
+                    else "Agent tool loop LLM response received"
+                ),
+                {
+                    "step_index": step_index,
+                    "provider": response.provider,
+                    "model": response.model,
+                    "has_tool_calls": bool(response.tool_calls),
+                    "tool_call_count": len(response.tool_calls),
+                    "final_response_exists": not response.tool_calls,
+                    **_finish_reason_metadata(response),
+                    **_usage_metadata(response),
+                },
+            )
+
             if not response.tool_calls:
+                self._emit(
+                    "agent_tool_loop_completed",
+                    "Agent tool loop completed",
+                    {
+                        "completed": True,
+                        "reason": "completed",
+                        "tool_result_count": len(all_tool_results),
+                        "step_count": len(steps),
+                        "provider": response.provider,
+                        "model": response.model,
+                    },
+                )
                 self._emit(
                     "agent_tool_loop.completed",
                     "Agent tool loop completed",
@@ -301,6 +402,20 @@ class AgentToolLoop:
                     },
                     warning=True,
                 )
+                self._emit(
+                    "agent_tool_loop_failed",
+                    "Agent tool loop approval required",
+                    {
+                        "completed": False,
+                        "reason": "approval_required",
+                        "step_index": step_index,
+                        "tool_call_count": len(response.tool_calls),
+                        "tool_names": tool_names,
+                        "provider": response.provider,
+                        "model": response.model,
+                    },
+                    warning=True,
+                )
                 return self._result(
                     completed=False,
                     reason="approval_required",
@@ -333,6 +448,18 @@ class AgentToolLoop:
             outcomes: list[_ToolOutcome] = []
             executed_tool_calls: list[LLMToolCall] = []
             for tool_call in response.tool_calls:
+                self._emit(
+                    "tool_call_requested",
+                    "Agent tool loop tool call requested",
+                    {
+                        "step_index": step_index,
+                        "tool_call_id": tool_call.id,
+                        "tool_name": tool_call.name,
+                        "argument_keys": _argument_keys(tool_call.arguments),
+                        "provider": response.provider,
+                        "model": response.model,
+                    },
+                )
                 outcome = self._execute_tool_call(
                     tool_call,
                     allowed_tool_names=allowed_tool_names,
@@ -377,6 +504,21 @@ class AgentToolLoop:
                     provider=response.provider,
                     model=response.model,
                 )
+                self._emit(
+                    "agent_tool_loop_failed",
+                    "Agent tool loop failed",
+                    {
+                        "completed": False,
+                        "reason": "tool_error",
+                        "step_index": step_index,
+                        "tool_result_count": len(all_tool_results),
+                        "error_type": failed_outcome.error_type or "ToolExecutionError",
+                        "error_category": failed_outcome.error_category or "tool_error",
+                        "provider": response.provider,
+                        "model": response.model,
+                    },
+                    error=True,
+                )
                 return self._result(
                     completed=False,
                     reason="tool_error",
@@ -415,6 +557,19 @@ class AgentToolLoop:
         model: str,
     ) -> _ToolOutcome:
         self._emit(
+            "tool_execution_started",
+            "Agent tool loop tool execution started",
+            {
+                "step_index": step_index,
+                "max_steps": max_steps,
+                "tool_call_id": tool_call.id,
+                "tool_name": tool_call.name,
+                "success": False,
+                "provider": provider,
+                "model": model,
+            },
+        )
+        self._emit(
             "agent_tool_loop.tool_execution_started",
             "Agent tool loop tool execution started",
             {
@@ -451,6 +606,26 @@ class AgentToolLoop:
             "agent_tool_loop.tool_execution_completed"
             if outcome.success
             else "agent_tool_loop.tool_execution_failed"
+        )
+        self._emit(
+            "tool_execution_completed" if outcome.success else "tool_execution_failed",
+            (
+                "Agent tool loop tool execution completed"
+                if outcome.success
+                else "Agent tool loop tool execution failed"
+            ),
+            {
+                "step_index": step_index,
+                "max_steps": max_steps,
+                "tool_call_id": tool_call.id,
+                "tool_name": tool_call.name,
+                "success": outcome.success,
+                "provider": provider,
+                "model": model,
+                **_tool_result_preview_metadata(outcome.llm_result),
+                **_safe_error_metadata(outcome.error_type, outcome.error_category),
+            },
+            error=not outcome.success,
         )
         self._emit(
             event_type,
@@ -526,6 +701,19 @@ class AgentToolLoop:
             error_category="max_steps_exceeded",
             provider=provider,
             model=model,
+        )
+        self._emit(
+            "agent_tool_loop_failed",
+            "Agent tool loop failed",
+            {
+                "completed": False,
+                "reason": "max_steps_exceeded",
+                "step_index": step_index,
+                "error_type": "AgentToolLoopMaxStepsExceeded",
+                "error_category": "max_steps_exceeded",
+                **_safe_request_route_metadata(provider, model),
+            },
+            error=True,
         )
 
     def _emit_failed(
@@ -752,3 +940,59 @@ def _safe_error_metadata(
     if error_category is not None:
         metadata["error_category"] = error_category
     return metadata
+
+
+def _agent_metadata(metadata: Mapping[str, Any] | None) -> dict[str, str]:
+    if metadata is None:
+        return {}
+    values: dict[str, str] = {}
+    for source_key, target_key in (
+        ("agent", "agent"),
+        ("agent_id", "agent_id"),
+        ("agent_name", "agent_name"),
+    ):
+        value = metadata.get(source_key)
+        if _is_short_scalar(value):
+            values[target_key] = str(value)
+    return values
+
+
+def _finish_reason_metadata(response: LLMResponse) -> dict[str, str]:
+    finish_reason = response.metadata.get("finish_reason")
+    if _is_short_scalar(finish_reason):
+        return {"finish_reason": str(finish_reason)}
+    return {}
+
+
+def _usage_metadata(response: LLMResponse) -> dict[str, int]:
+    usage = response.usage
+    if usage is None:
+        return {}
+    metadata: dict[str, int] = {}
+    if usage.prompt_tokens is not None:
+        metadata["prompt_tokens"] = usage.prompt_tokens
+    if usage.completion_tokens is not None:
+        metadata["completion_tokens"] = usage.completion_tokens
+    if usage.total_tokens is not None:
+        metadata["total_tokens"] = usage.total_tokens
+    return metadata
+
+
+def _argument_keys(arguments: Mapping[str, Any]) -> tuple[str, ...]:
+    return tuple(sorted(str(key) for key in arguments))
+
+
+def _tool_result_preview_metadata(tool_result: LLMToolResult) -> dict[str, str]:
+    preview_source = tool_result.content if tool_result.success else tool_result.error
+    if not isinstance(preview_source, str) or not preview_source:
+        return {}
+    preview = preview_source.replace("\n", " ")
+    if tool_result.success and preview.strip().startswith(("{", "[")):
+        return {}
+    if len(preview) > 80:
+        preview = f"{preview[:77]}..."
+    return {"output_preview" if tool_result.success else "error_preview": preview}
+
+
+def _is_short_scalar(value: Any) -> bool:
+    return isinstance(value, (str, int, float, bool)) and len(str(value)) <= 120
