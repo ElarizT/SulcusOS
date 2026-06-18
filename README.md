@@ -482,3 +482,39 @@ them, ready for a future UI approval flow. Safe `RuntimeEvent`s expose only
 metadata such as step index, provider/model, tool names, tool counts, success
 markers, and error categories; prompts, argument values, API keys, headers, raw
 provider responses, and stack traces are not logged by default.
+
+### Agent Tool Loop Demo
+
+Step 36 stabilizes the Phase 6 Agent Tool Loop demo as a regression foundation.
+Run the live smoke test with an OpenAI-compatible provider configured:
+
+```powershell
+$env:AGENTOS_LLM_API_KEY = "..."
+python examples/agent_tool_loop_phase6_smoke_test.py
+```
+
+Expected output shows `Completed: True`, `Reason: completed`, one successful
+`add_numbers` tool execution result with content `"42"`, a final LLM response
+that mentions `42`, and `Phase 6 Agent Tool Loop smoke test passed.`
+
+The demo proves the first verified Sulcus OS flow where:
+
+```text
+Agent -> LLM -> tool call -> tool runtime -> tool result -> LLM final response
+```
+
+This matters because it confirms that the LLM runtime, registered tool runtime,
+and bounded agent orchestration loop can work together without letting
+`LLMRuntime.chat` execute tools implicitly. Live provider calls stay in examples
+and manual smoke tests. CI coverage uses deterministic providers and does not
+require API keys or internet access.
+
+For an offline multi-tool demo, run:
+
+```powershell
+python examples/agent_tool_loop_multi_tool_demo.py
+```
+
+That scripted demo verifies a single agent tool loop run can execute both
+`add_numbers` and `multiply_numbers`, feed both tool execution results back to
+the LLM, and produce a final LLM response containing both results.

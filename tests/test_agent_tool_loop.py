@@ -43,6 +43,14 @@ def add_tool_definition() -> LLMToolDefinition:
     )
 
 
+def multiply_tool_definition() -> LLMToolDefinition:
+    return LLMToolDefinition(
+        name="multiply_numbers",
+        description="Multiply two numbers.",
+        parameters_schema=add_schema(),
+    )
+
+
 def tool_call(
     tool_call_id: str,
     name: str = "add_numbers",
@@ -141,6 +149,78 @@ def test_one_tool_call_then_final_response() -> None:
     assert provider.requests[1].messages[2].content == "42"
     assert provider.requests[1].messages[2].metadata["tool_call_id"] == "call_1"
     assert result.tool_results[0].content == "42"
+
+
+def test_multiple_tool_calls_in_one_llm_response_then_final_response() -> None:
+    executions: list[tuple[str, float, float]] = []
+    registry = ToolRegistry()
+
+    def add_numbers(a: float, b: float) -> float:
+        executions.append(("add_numbers", a, b))
+        return a + b
+
+    def multiply_numbers(a: float, b: float) -> float:
+        executions.append(("multiply_numbers", a, b))
+        return a * b
+
+    registry.register(
+        name="add_numbers",
+        description="Add two numbers.",
+        parameters_schema=add_schema(),
+        func=add_numbers,
+    )
+    registry.register(
+        name="multiply_numbers",
+        description="Multiply two numbers.",
+        parameters_schema=add_schema(),
+        func=multiply_numbers,
+    )
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                tool_call("call_add", arguments={"a": 15, "b": 27}),
+                tool_call(
+                    "call_multiply",
+                    name="multiply_numbers",
+                    arguments={"a": 6, "b": 9},
+                ),
+            ),
+            final_response("The sum is 42 and the product is 54."),
+        ]
+    )
+    loop = build_loop(provider, registry)
+
+    result = loop.run(
+        [{"role": "user", "content": "Use both arithmetic tools."}],
+        tools=[add_tool_definition(), multiply_tool_definition()],
+    )
+
+    assert result.completed is True
+    assert result.reason == "completed"
+    assert result.final_response == final_response(
+        "The sum is 42 and the product is 54."
+    )
+    assert executions == [
+        ("add_numbers", 15, 27),
+        ("multiply_numbers", 6, 9),
+    ]
+    assert [tool_result.name for tool_result in result.tool_results] == [
+        "add_numbers",
+        "multiply_numbers",
+    ]
+    assert [tool_result.content for tool_result in result.tool_results] == ["42", "54"]
+    assert [tool_result.success for tool_result in result.tool_results] == [True, True]
+    assert len(provider.requests) == 2
+    assert [message.role for message in provider.requests[1].messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "tool",
+    ]
+    assert provider.requests[1].messages[2].metadata["name"] == "add_numbers"
+    assert provider.requests[1].messages[2].content == "42"
+    assert provider.requests[1].messages[3].metadata["name"] == "multiply_numbers"
+    assert provider.requests[1].messages[3].content == "54"
 
 
 def test_multiple_sequential_tool_calls() -> None:

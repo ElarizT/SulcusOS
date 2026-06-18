@@ -9,8 +9,27 @@ from kernel.llm import LLMRuntime, OpenAICompatibleProvider
 from kernel.tools import ToolRegistry, ToolRuntime
 
 
+EXPECTED_TOOL_NAME = "add_numbers"
+EXPECTED_TOOL_RESULT = "42"
+
+
 def add_numbers(a: float, b: float) -> float:
     return a + b
+
+
+def assert_successful_agent_tool_loop_result(result) -> None:
+    assert result.completed is True
+    assert result.reason == "completed"
+    assert len(result.tool_results) == 1
+
+    tool_execution_result = result.tool_results[0]
+    assert tool_execution_result.success is True
+    assert tool_execution_result.name == EXPECTED_TOOL_NAME
+    assert tool_execution_result.content == EXPECTED_TOOL_RESULT
+
+    final_llm_response = result.final_response
+    assert final_llm_response is not None
+    assert EXPECTED_TOOL_RESULT in final_llm_response.content
 
 
 def main() -> None:
@@ -34,7 +53,7 @@ def main() -> None:
 
     registry = ToolRegistry()
     registry.register(
-        name="add_numbers",
+        name=EXPECTED_TOOL_NAME,
         description="Add two numbers together.",
         parameters_schema={
             "type": "object",
@@ -71,14 +90,24 @@ def main() -> None:
         tool_choice="auto",
     )
 
+    print("Phase 6 Agent Tool Loop smoke test")
     print("Completed:", result.completed)
     print("Reason:", result.reason)
-    print("Tool results:", result.tool_results)
+    print("Tool execution results:")
+    for tool_execution_result in result.tool_results:
+        print(
+            "  "
+            f"{tool_execution_result.name}: "
+            f"success={tool_execution_result.success}, "
+            f"content={tool_execution_result.content!r}"
+        )
     if result.final_response is not None:
-        print("Final response:")
+        print("Final LLM response:")
         print(result.final_response.content)
 
-    if not result.completed:
+    try:
+        assert_successful_agent_tool_loop_result(result)
+    except AssertionError as exc:
         print("\nSafe runtime events:")
         for event in events.events:
             print(event.event_type, event.metadata)
@@ -86,19 +115,8 @@ def main() -> None:
         for step in result.steps:
             print(step)
         raise RuntimeError(
-            "Agent tool loop smoke test did not complete. "
-            f"reason={result.reason}"
-        )
-
-    if result.final_response is None:
-        raise RuntimeError("Agent tool loop completed without a final response")
-    if not result.tool_results:
-        raise RuntimeError("Agent tool loop completed without executing a tool")
-    if result.tool_results[0].content != "42":
-        raise RuntimeError(
-            "Expected add_numbers tool result content to be 42, got "
-            f"{result.tool_results[0].content!r}"
-        )
+            "Agent tool loop smoke test failed regression assertions"
+        ) from exc
 
     print("\nPhase 6 Agent Tool Loop smoke test passed.")
 
