@@ -28,8 +28,8 @@ TIMELINE_EVENT_TYPES = {
 }
 
 
-class ScriptedMultiToolProvider:
-    name = "scripted-agent-tool-loop-demo"
+class ScriptedMultiRoundProvider:
+    name = "scripted-agent-tool-loop-multi-round-demo"
     default_model = "scripted-model"
 
     def __init__(self) -> None:
@@ -43,21 +43,28 @@ class ScriptedMultiToolProvider:
                     LLMToolCall(
                         id="call_add",
                         name="add_numbers",
-                        arguments={"a": 15, "b": 27},
-                        provider=self.name,
-                        model=self.default_model,
-                    ),
-                    LLMToolCall(
-                        id="call_multiply",
-                        name="multiply_numbers",
-                        arguments={"a": 6, "b": 9},
+                        arguments={"a": 20, "b": 22},
                         provider=self.name,
                         model=self.default_model,
                     ),
                 ),
             ),
             LLMResponse(
-                content="The sum is 42 and the product is 54.",
+                content="",
+                provider=self.name,
+                model=self.default_model,
+                tool_calls=(
+                    LLMToolCall(
+                        id="call_multiply",
+                        name="multiply_numbers",
+                        arguments={"a": 42, "b": 2},
+                        provider=self.name,
+                        model=self.default_model,
+                    ),
+                ),
+            ),
+            LLMResponse(
+                content="The final answer is 84.",
                 provider=self.name,
                 model=self.default_model,
             ),
@@ -99,25 +106,6 @@ def build_tool_registry() -> ToolRegistry:
     return registry
 
 
-def assert_multi_tool_demo_result(result, provider: ScriptedMultiToolProvider) -> None:
-    assert result.completed is True
-    assert result.reason == "completed"
-    assert result.final_response is not None
-    assert "42" in result.final_response.content
-    assert "54" in result.final_response.content
-    assert len(result.tool_results) == 2
-    assert [tool_result.name for tool_result in result.tool_results] == [
-        "add_numbers",
-        "multiply_numbers",
-    ]
-    assert [tool_result.content for tool_result in result.tool_results] == ["42", "54"]
-    assert all(tool_result.success for tool_result in result.tool_results)
-    assert len(provider.requests) == 2
-
-    follow_up_roles = [message.role for message in provider.requests[1].messages]
-    assert follow_up_roles == ["user", "assistant", "tool", "tool"]
-
-
 def print_timeline(events: RuntimeEventLog) -> None:
     print("\nTimeline:")
     timeline_events = [
@@ -133,13 +121,37 @@ def print_timeline(events: RuntimeEventLog) -> None:
             f" final_attempt={final_attempt}" if isinstance(final_attempt, bool) else ""
         )
         tool_name = event.metadata.get("tool_name")
-        suffix = f" {tool_name}" if isinstance(tool_name, str) else ""
-        print(f"{index}. {event.event_type}{suffix}{round_suffix}{final_suffix}")
+        tool_suffix = f" {tool_name}" if isinstance(tool_name, str) else ""
+        print(f"{index}. {event.event_type}{tool_suffix}{round_suffix}{final_suffix}")
+
+
+def assert_multi_round_demo_result(
+    result,
+    provider: ScriptedMultiRoundProvider,
+) -> None:
+    assert result.completed is True
+    assert result.reason == "completed"
+    assert result.final_response is not None
+    assert "84" in result.final_response.content
+    assert [tool_result.name for tool_result in result.tool_results] == [
+        "add_numbers",
+        "multiply_numbers",
+    ]
+    assert [tool_result.content for tool_result in result.tool_results] == ["42", "84"]
+    assert all(tool_result.success for tool_result in result.tool_results)
+    assert len(provider.requests) == 3
+    assert [message.role for message in provider.requests[2].messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+        "tool",
+    ]
 
 
 def main() -> None:
     events = RuntimeEventLog()
-    provider = ScriptedMultiToolProvider()
+    provider = ScriptedMultiRoundProvider()
     registry = build_tool_registry()
     loop = AgentToolLoop(
         llm_runtime=LLMRuntime(provider=provider, event_sink=events),
@@ -152,8 +164,8 @@ def main() -> None:
             {
                 "role": "user",
                 "content": (
-                    "Use add_numbers for 15 + 27 and multiply_numbers for 6 * 9, "
-                    "then answer with both results."
+                    "First add 20 + 22, then multiply that result by 2, "
+                    "then answer with the final result."
                 ),
             }
         ],
@@ -163,7 +175,7 @@ def main() -> None:
         tool_choice="auto",
     )
 
-    print("Agent Tool Loop multi-tool demo")
+    print("Agent Tool Loop multi-round demo")
     print("Completed:", result.completed)
     print("Reason:", result.reason)
     print("Tool execution results:")
@@ -180,7 +192,7 @@ def main() -> None:
     print_timeline(events)
 
     try:
-        assert_multi_tool_demo_result(result, provider)
+        assert_multi_round_demo_result(result, provider)
     except AssertionError as exc:
         print("\nSafe runtime events:")
         for event in events.events:
@@ -188,9 +200,9 @@ def main() -> None:
         print("\nSteps:")
         for step in result.steps:
             print(step)
-        raise RuntimeError("Agent tool loop multi-tool demo failed") from exc
+        raise RuntimeError("Agent tool loop multi-round demo failed") from exc
 
-    print("\nAgent Tool Loop multi-tool demo passed.")
+    print("\nAgent Tool Loop multi-round demo passed.")
 
 
 if __name__ == "__main__":

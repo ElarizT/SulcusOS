@@ -12,7 +12,7 @@ class ScriptedProvider:
     name = "fake-agent-llm"
     default_model = "fake-model"
 
-    def __init__(self, responses: list[LLMResponse]) -> None:
+    def __init__(self, responses: list[LLMResponse | Exception]) -> None:
         self.responses = list(responses)
         self.requests: list[LLMRequest] = []
 
@@ -20,7 +20,10 @@ class ScriptedProvider:
         self.requests.append(request)
         if not self.responses:
             raise AssertionError("unexpected LLM call")
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 class FailingProvider:
@@ -123,6 +126,36 @@ def add_registry(executions: list[tuple[float, float]] | None = None) -> ToolReg
     return registry
 
 
+def arithmetic_registry(
+    executions: list[tuple[str, float, float]] | None = None,
+) -> ToolRegistry:
+    registry = ToolRegistry()
+
+    def add_numbers(a: float, b: float) -> float:
+        if executions is not None:
+            executions.append(("add_numbers", a, b))
+        return a + b
+
+    def multiply_numbers(a: float, b: float) -> float:
+        if executions is not None:
+            executions.append(("multiply_numbers", a, b))
+        return a * b
+
+    registry.register(
+        name="add_numbers",
+        description="Add two numbers.",
+        parameters_schema=add_schema(),
+        func=add_numbers,
+    )
+    registry.register(
+        name="multiply_numbers",
+        description="Multiply two numbers.",
+        parameters_schema=add_schema(),
+        func=multiply_numbers,
+    )
+    return registry
+
+
 def build_loop(
     provider: ScriptedProvider,
     registry: ToolRegistry,
@@ -147,6 +180,13 @@ def test_final_response_with_no_tool_calls_completes() -> None:
     assert result.pending_tool_calls == ()
     assert provider.requests[0].tools == ()
     assert events.by_type("agent_tool_loop.completed")
+    assert timeline_event_types(events) == [
+        "agent_tool_loop_started",
+        "llm_request_started",
+        "llm_response_received",
+        "agent_tool_loop_completed",
+    ]
+    assert result.tool_results == ()
 
 
 def test_one_tool_call_then_final_response() -> None:
@@ -194,7 +234,9 @@ def test_successful_one_tool_loop_emits_timeline_events() -> None:
         "tool_call_requested",
         "tool_execution_started",
         "tool_execution_completed",
+        "llm_followup_request_started",
         "llm_final_request_started",
+        "llm_followup_response_received",
         "llm_final_response_received",
         "agent_tool_loop_completed",
     ]
@@ -208,6 +250,7 @@ def test_successful_one_tool_loop_emits_timeline_events() -> None:
     assert completed.metadata["completed"] is True
     assert completed.metadata["reason"] == "completed"
     assert completed.metadata["tool_result_count"] == 1
+    assert completed.metadata["round_index"] == 1
 
 
 def test_multiple_tool_calls_in_one_llm_response_then_final_response() -> None:
@@ -354,6 +397,151 @@ def test_multiple_sequential_tool_calls() -> None:
     assert executions == [(1, 2), (3, 4)]
     assert [tool_result.content for tool_result in result.tool_results] == ["3", "7"]
     assert len(provider.requests) == 3
+
+
+def test_multi_round_two_tool_loop_reaches_final_response() -> None:
+    executions: list[tuple[str, float, float]] = []
+    provider = ScriptedProvider(
+        [
+            tool_response(tool_call("call_add", arguments={"a": 20, "b": 22})),
+            tool_response(
+                tool_call(
+                    "call_multiply",
+                    name="multiply_numbers",
+                    arguments={"a": 42, "b": 2},
+                )
+            ),
+            final_response("The final answer is 84."),
+        ]
+    )
+    events = RuntimeEventLog()
+    loop = build_loop(provider, arithmetic_registry(executions), events)
+
+    result = loop.run(
+        [{"role": "user", "content": "Compute a multi-round answer."}],
+        tools=[add_tool_definition(), multiply_tool_definition()],
+        max_steps=4,
+    )
+
+    assert result.completed is True
+    assert result.reason == "completed"
+    assert result.final_response is not None
+    assert "84" in result.final_response.content
+    assert executions == [
+        ("add_numbers", 20, 22),
+        ("multiply_numbers", 42, 2),
+    ]
+    assert [tool_result.name for tool_result in result.tool_results] == [
+        "add_numbers",
+        "multiply_numbers",
+    ]
+    assert [tool_result.content for tool_result in result.tool_results] == ["42", "84"]
+    assert [tool_result.success for tool_result in result.tool_results] == [True, True]
+    assert len(provider.requests) == 3
+    assert [message.role for message in provider.requests[1].messages] == [
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assert provider.requests[1].messages[2].content == "42"
+    assert [message.role for message in provider.requests[2].messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+        "tool",
+    ]
+    assert provider.requests[2].messages[2].content == "42"
+    assert provider.requests[2].messages[4].content == "84"
+    assert [event.metadata["round_index"] for event in events.by_type("llm_followup_request_started")] == [
+        1,
+        2,
+    ]
+    assert events.by_type("llm_final_response_received")[0].metadata["round_index"] == 2
+
+
+def test_multi_round_max_steps_stops_before_unbounded_tool_execution() -> None:
+    executions: list[tuple[float, float]] = []
+    provider = ScriptedProvider(
+        [
+            tool_response(tool_call("call_1", arguments={"a": 1, "b": 2})),
+            tool_response(tool_call("call_2", arguments={"a": 3, "b": 4})),
+        ]
+    )
+    events = RuntimeEventLog()
+    loop = build_loop(provider, add_registry(executions), events)
+
+    result = loop.run(
+        [{"role": "user", "content": "keep calling tools"}],
+        tools=[add_tool_definition()],
+        max_steps=2,
+    )
+
+    assert result.completed is False
+    assert result.reason == "max_steps_exceeded"
+    assert executions == [(1, 2)]
+    assert result.pending_tool_calls == (tool_call("call_2", arguments={"a": 3, "b": 4}),)
+    failed = events.by_type("agent_tool_loop_failed")[-1]
+    assert failed.metadata["reason"] == "max_steps_exceeded"
+    assert failed.metadata["round_index"] == 1
+
+
+def test_multi_round_tool_failure_preserves_existing_failure_semantics() -> None:
+    events = RuntimeEventLog()
+    provider = ScriptedProvider(
+        [
+            tool_response(tool_call("call_1", arguments={"a": 20, "b": 22})),
+            tool_response(
+                tool_call(
+                    "call_bad",
+                    name="multiply_numbers",
+                    arguments={"a": 42},
+                )
+            ),
+        ]
+    )
+    loop = build_loop(provider, arithmetic_registry(), events)
+
+    result = loop.run(
+        [{"role": "user", "content": "fail in the second round"}],
+        tools=[add_tool_definition(), multiply_tool_definition()],
+        max_steps=4,
+    )
+
+    assert result.completed is False
+    assert result.reason == "tool_error"
+    assert [tool_result.name for tool_result in result.tool_results] == [
+        "add_numbers",
+        "multiply_numbers",
+    ]
+    assert result.tool_results[-1].success is False
+    assert events.by_type("tool_execution_failed")[0].metadata["round_index"] == 1
+    assert events.by_type("agent_tool_loop_failed")[-1].metadata["reason"] == "tool_error"
+
+
+def test_multi_round_llm_provider_failure_in_followup_round() -> None:
+    events = RuntimeEventLog()
+    provider = ScriptedProvider(
+        [
+            tool_response(tool_call("call_1", arguments={"a": 20, "b": 22})),
+            RuntimeError("follow-up provider failed"),
+        ]
+    )
+    loop = build_loop(provider, add_registry(), events)
+
+    result = loop.run(
+        [{"role": "user", "content": "fail after one tool"}],
+        tools=[add_tool_definition()],
+        max_steps=4,
+    )
+
+    assert result.completed is False
+    assert result.reason == "llm_error"
+    assert [tool_result.content for tool_result in result.tool_results] == ["42"]
+    assert len(provider.requests) == 2
+    failed = events.by_type("agent_tool_loop_failed")[-1]
+    assert failed.metadata["reason"] == "llm_error"
+    assert failed.metadata["round_index"] == 1
 
 
 def test_unknown_tool_failure_is_sanitized() -> None:

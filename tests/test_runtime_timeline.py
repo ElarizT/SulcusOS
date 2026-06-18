@@ -89,6 +89,7 @@ def test_timeline_formats_agent_tool_loop_tool_events_clearly() -> None:
             "Tool execution completed",
             {
                 "tool_name": "add_numbers",
+                "round_index": 1,
                 "success": True,
                 "tool_call_id": "call_1",
             },
@@ -98,6 +99,7 @@ def test_timeline_formats_agent_tool_loop_tool_events_clearly() -> None:
     assert "agent_tool_loop" in row
     assert "add_numbers" in row
     assert "tool_execution_completed" in row
+    assert "round_index=1" in row
     assert "success=True" in row
     assert "tool_call_id" not in row
 

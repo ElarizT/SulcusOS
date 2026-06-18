@@ -546,12 +546,44 @@ Timeline:
 7. tool_call_requested multiply_numbers
 8. tool_execution_started multiply_numbers
 9. tool_execution_completed multiply_numbers
-10. llm_final_request_started
-11. llm_final_response_received
-12. agent_tool_loop_completed
+10. llm_followup_request_started
+11. llm_final_request_started final_attempt=False
+12. llm_followup_response_received
+13. llm_final_response_received
+14. agent_tool_loop_completed
 ```
 
 These events matter because dashboard and demo users can inspect the verified
 flow as structured runtime history instead of inferring it from print output.
 Live provider smoke tests still require `AGENTOS_LLM_API_KEY`; deterministic
 timeline tests run offline without API keys or internet access.
+
+### Multi-Round Agent Tool Loop
+
+Step 38 extends the Agent Tool Loop to keep running across multiple LLM/tool
+rounds until the LLM returns a final assistant response with no tool calls, a
+tool or provider error occurs, or `max_steps` is reached. One LLM response
+counts as one round, and tool calls within that response are executed
+sequentially.
+
+Run the offline deterministic multi-round demo:
+
+```powershell
+python examples/agent_tool_loop_multi_round_demo.py
+```
+
+Example flow:
+
+```text
+Round 1: LLM asks for add_numbers(20, 22)
+Round 1: Tool result is 42
+Round 2: LLM asks for multiply_numbers(42, 2)
+Round 2: Tool result is 84
+Round 3: LLM returns "The final answer is 84."
+```
+
+This matters because real agents often need more than one reasoning/tool cycle.
+Sulcus OS can now supervise those cycles with structured timeline events such
+as `llm_followup_request_started`, `llm_followup_response_received`, and
+round-indexed tool execution events. Live provider smoke tests still require
+`AGENTOS_LLM_API_KEY`, and parallel tool execution remains future work.

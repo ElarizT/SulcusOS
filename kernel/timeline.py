@@ -21,6 +21,8 @@ _SUBJECT_KEYS = (
     "worker",
 )
 _METADATA_KEYS = (
+    "round_index",
+    "step_index",
     "success",
     "reason",
     "tool_count",

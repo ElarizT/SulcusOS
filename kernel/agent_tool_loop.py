@@ -27,7 +27,11 @@ ToolInput = LLMToolDefinition | ToolDefinition | Mapping[str, Any]
 
 @dataclass(frozen=True)
 class AgentToolLoopConfig:
-    """Conservative controls for bounded LLM-tool orchestration."""
+    """Conservative controls for bounded LLM-tool orchestration.
+
+    One LLM response counts as one step/round. Tool calls returned by that
+    response are executed sequentially before the next LLM round.
+    """
 
     max_steps: int = 4
     require_tool_approval: bool = False
@@ -205,18 +209,28 @@ class AgentToolLoop:
                     for message in history_tool_results
                     if message.metadata.get("success") is True
                 )
+                followup_metadata = {
+                    "round_index": step_index,
+                    "step_index": step_index,
+                    "provider": route_metadata.get("provider"),
+                    "model": route_metadata.get("model"),
+                    "tool_result_count": len(history_tool_results),
+                    "successful_tool_result_count": successful_tool_results,
+                    "failed_tool_result_count": (
+                        len(history_tool_results) - successful_tool_results
+                    ),
+                }
+                self._emit(
+                    "llm_followup_request_started",
+                    "Agent tool loop follow-up LLM request started",
+                    followup_metadata,
+                )
                 self._emit(
                     "llm_final_request_started",
                     "Agent tool loop final LLM request started",
                     {
-                        "step_index": step_index,
-                        "provider": route_metadata.get("provider"),
-                        "model": route_metadata.get("model"),
-                        "tool_result_count": len(history_tool_results),
-                        "successful_tool_result_count": successful_tool_results,
-                        "failed_tool_result_count": (
-                            len(history_tool_results) - successful_tool_results
-                        ),
+                        **followup_metadata,
+                        "final_attempt": False,
                     },
                 )
             else:
@@ -224,6 +238,7 @@ class AgentToolLoop:
                     "llm_request_started",
                     "Agent tool loop LLM request started",
                     {
+                        "round_index": step_index,
                         "step_index": step_index,
                         "provider": route_metadata.get("provider"),
                         "model": route_metadata.get("model"),
@@ -278,6 +293,7 @@ class AgentToolLoop:
                     {
                         "completed": False,
                         "reason": "llm_error",
+                        "round_index": step_index,
                         "step_index": step_index,
                         "error_type": exc.__class__.__name__,
                         "error_category": error_category,
@@ -309,26 +325,45 @@ class AgentToolLoop:
             final_response_received = bool(history_tool_results) and not response.tool_calls
             self._emit(
                 (
-                    "llm_final_response_received"
-                    if final_response_received
+                    "llm_followup_response_received"
+                    if history_tool_results
                     else "llm_response_received"
                 ),
                 (
-                    "Agent tool loop final LLM response received"
-                    if final_response_received
+                    "Agent tool loop follow-up LLM response received"
+                    if history_tool_results
                     else "Agent tool loop LLM response received"
                 ),
                 {
+                    "round_index": step_index,
                     "step_index": step_index,
                     "provider": response.provider,
                     "model": response.model,
                     "has_tool_calls": bool(response.tool_calls),
                     "tool_call_count": len(response.tool_calls),
+                    "tool_result_count": len(all_tool_results),
                     "final_response_exists": not response.tool_calls,
                     **_finish_reason_metadata(response),
                     **_usage_metadata(response),
                 },
             )
+            if final_response_received:
+                self._emit(
+                    "llm_final_response_received",
+                    "Agent tool loop final LLM response received",
+                    {
+                        "round_index": step_index,
+                        "step_index": step_index,
+                        "provider": response.provider,
+                        "model": response.model,
+                        "has_tool_calls": False,
+                        "tool_call_count": 0,
+                        "tool_result_count": len(all_tool_results),
+                        "final_response_exists": True,
+                        **_finish_reason_metadata(response),
+                        **_usage_metadata(response),
+                    },
+                )
 
             if not response.tool_calls:
                 self._emit(
@@ -337,6 +372,7 @@ class AgentToolLoop:
                     {
                         "completed": True,
                         "reason": "completed",
+                        "round_index": step_index,
                         "tool_result_count": len(all_tool_results),
                         "step_count": len(steps),
                         "provider": response.provider,
@@ -368,6 +404,7 @@ class AgentToolLoop:
                 "agent_tool_loop.tool_calls_received",
                 "Agent tool loop received tool calls",
                 {
+                    "round_index": step_index,
                     "step_index": step_index,
                     "max_steps": config.max_steps,
                     "tool_count": len(response.tool_calls),
@@ -408,6 +445,7 @@ class AgentToolLoop:
                     {
                         "completed": False,
                         "reason": "approval_required",
+                        "round_index": step_index,
                         "step_index": step_index,
                         "tool_call_count": len(response.tool_calls),
                         "tool_names": tool_names,
@@ -452,6 +490,7 @@ class AgentToolLoop:
                     "tool_call_requested",
                     "Agent tool loop tool call requested",
                     {
+                        "round_index": step_index,
                         "step_index": step_index,
                         "tool_call_id": tool_call.id,
                         "tool_name": tool_call.name,
@@ -510,6 +549,7 @@ class AgentToolLoop:
                     {
                         "completed": False,
                         "reason": "tool_error",
+                        "round_index": step_index,
                         "step_index": step_index,
                         "tool_result_count": len(all_tool_results),
                         "error_type": failed_outcome.error_type or "ToolExecutionError",
@@ -560,6 +600,7 @@ class AgentToolLoop:
             "tool_execution_started",
             "Agent tool loop tool execution started",
             {
+                "round_index": step_index,
                 "step_index": step_index,
                 "max_steps": max_steps,
                 "tool_call_id": tool_call.id,
@@ -615,6 +656,7 @@ class AgentToolLoop:
                 else "Agent tool loop tool execution failed"
             ),
             {
+                "round_index": step_index,
                 "step_index": step_index,
                 "max_steps": max_steps,
                 "tool_call_id": tool_call.id,
@@ -708,6 +750,7 @@ class AgentToolLoop:
             {
                 "completed": False,
                 "reason": "max_steps_exceeded",
+                "round_index": step_index,
                 "step_index": step_index,
                 "error_type": "AgentToolLoopMaxStepsExceeded",
                 "error_category": "max_steps_exceeded",
