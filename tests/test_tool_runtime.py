@@ -43,6 +43,7 @@ def test_tool_registration_and_safe_registered_event() -> None:
     assert events.events[0].metadata == {
         "tool_name": "add_numbers",
         "success": True,
+        "parallel_safe": False,
         "property_count": 2,
         "required_count": 2,
     }
@@ -110,6 +111,7 @@ def test_registry_listing_and_snapshot_are_deterministic() -> None:
             "description": "First.",
             "parameters_schema": {"type": "object"},
             "timeout_seconds": 3,
+            "parallel_safe": False,
             "metadata": {},
         },
         {
@@ -117,6 +119,7 @@ def test_registry_listing_and_snapshot_are_deterministic() -> None:
             "description": "Last.",
             "parameters_schema": {"type": "object"},
             "timeout_seconds": None,
+            "parallel_safe": False,
             "metadata": {},
         },
     )

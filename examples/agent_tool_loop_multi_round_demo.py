@@ -17,6 +17,9 @@ TIMELINE_EVENT_TYPES = {
     "llm_response_received",
     "llm_followup_request_started",
     "llm_followup_response_received",
+    "tool_execution_group_started",
+    "tool_execution_group_completed",
+    "tool_execution_group_failed",
     "tool_call_requested",
     "tool_execution_started",
     "tool_execution_completed",
@@ -120,9 +123,18 @@ def print_timeline(events: RuntimeEventLog) -> None:
         final_suffix = (
             f" final_attempt={final_attempt}" if isinstance(final_attempt, bool) else ""
         )
+        execution_mode = event.metadata.get("execution_mode")
+        mode_suffix = (
+            f" execution_mode={execution_mode}"
+            if isinstance(execution_mode, str)
+            else ""
+        )
         tool_name = event.metadata.get("tool_name")
         tool_suffix = f" {tool_name}" if isinstance(tool_name, str) else ""
-        print(f"{index}. {event.event_type}{tool_suffix}{round_suffix}{final_suffix}")
+        print(
+            f"{index}. {event.event_type}{tool_suffix}"
+            f"{round_suffix}{mode_suffix}{final_suffix}"
+        )
 
 
 def assert_multi_round_demo_result(

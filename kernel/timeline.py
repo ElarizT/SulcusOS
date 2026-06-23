@@ -23,10 +23,13 @@ _SUBJECT_KEYS = (
 _METADATA_KEYS = (
     "round_index",
     "step_index",
+    "execution_mode",
     "success",
     "reason",
     "tool_count",
     "tool_call_count",
+    "successful_tool_count",
+    "failed_tool_count",
     "tool_result_count",
     "duration_ms",
     "error_type",

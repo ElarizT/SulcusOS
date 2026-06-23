@@ -32,6 +32,7 @@ class ToolDefinition:
     parameters_schema: dict[str, Any]
     func: Callable[..., Any]
     timeout_seconds: float | None = None
+    parallel_safe: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -42,6 +43,8 @@ class ToolDefinition:
             raise ValueError("tool parameters_schema must be a mapping")
         if not callable(self.func):
             raise ValueError("tool func must be callable")
+        if not isinstance(self.parallel_safe, bool):
+            raise ValueError("tool parallel_safe must be a boolean")
         if self.timeout_seconds is not None:
             if isinstance(self.timeout_seconds, bool) or not isinstance(
                 self.timeout_seconds, (int, float)
@@ -154,6 +157,7 @@ def tool_definition_from_llm(
     *,
     func: Callable[..., Any],
     timeout_seconds: float | None = None,
+    parallel_safe: bool = False,
     metadata: Mapping[str, Any] | None = None,
 ) -> ToolDefinition:
     """Attach an approved callable to an LLM tool definition."""
@@ -165,6 +169,7 @@ def tool_definition_from_llm(
         parameters_schema=tool.parameters_schema,
         func=func,
         timeout_seconds=timeout_seconds,
+        parallel_safe=parallel_safe,
         metadata=dict(metadata or {}),
     )
 
