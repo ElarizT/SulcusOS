@@ -104,6 +104,32 @@ def test_timeline_formats_agent_tool_loop_tool_events_clearly() -> None:
     assert "tool_call_id" not in row
 
 
+def test_timeline_formats_tool_execution_group_mode_metadata() -> None:
+    row = format_timeline_event(
+        event(
+            15,
+            "AgentToolLoop",
+            "tool_execution_group_completed",
+            "Tool execution group completed",
+            {
+                "execution_mode": "sequential",
+                "round_index": 0,
+                "tool_call_count": 2,
+                "successful_tool_count": 2,
+                "failed_tool_count": 0,
+                "tool_names": ("add_numbers", "multiply_numbers"),
+            },
+        )
+    )
+
+    assert "tool_execution_group_completed" in row
+    assert "execution_mode=sequential" in row
+    assert "tool_call_count=2" in row
+    assert "successful_tool_count=2" in row
+    assert "failed_tool_count=0" in row
+    assert "tool_names" not in row
+
+
 def test_timeline_safely_renders_legacy_strings_and_dictionaries() -> None:
     rows = render_runtime_timeline(
         [

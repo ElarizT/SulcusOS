@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from kernel.agent_tool_loop import AgentToolLoop
+from kernel.agent_tool_loop import AgentToolLoop, AgentToolLoopConfig
 from kernel.events import RuntimeEventLog
 from kernel.llm import LLMMessage, LLMRequest, LLMResponse, LLMRuntime, LLMToolCall, LLMToolDefinition
 from kernel.tools import ToolRegistry, ToolRuntime
@@ -160,11 +160,19 @@ def build_loop(
     provider: ScriptedProvider,
     registry: ToolRegistry,
     events: RuntimeEventLog | None = None,
+    config: AgentToolLoopConfig | None = None,
 ) -> AgentToolLoop:
     return AgentToolLoop(
         llm_runtime=LLMRuntime(provider, events),
         tool_runtime=ToolRuntime(registry=registry, event_sink=events),
+        config=config,
     )
+
+
+def test_default_tool_execution_mode_is_sequential() -> None:
+    config = AgentToolLoopConfig()
+
+    assert config.tool_execution_mode == "sequential"
 
 
 def test_final_response_with_no_tool_calls_completes() -> None:
@@ -180,6 +188,9 @@ def test_final_response_with_no_tool_calls_completes() -> None:
     assert result.pending_tool_calls == ()
     assert provider.requests[0].tools == ()
     assert events.by_type("agent_tool_loop.completed")
+    assert events.by_type("agent_tool_loop_started")[0].metadata["execution_mode"] == (
+        "sequential"
+    )
     assert timeline_event_types(events) == [
         "agent_tool_loop_started",
         "llm_request_started",
@@ -231,9 +242,11 @@ def test_successful_one_tool_loop_emits_timeline_events() -> None:
         "agent_tool_loop_started",
         "llm_request_started",
         "llm_response_received",
+        "tool_execution_group_started",
         "tool_call_requested",
         "tool_execution_started",
         "tool_execution_completed",
+        "tool_execution_group_completed",
         "llm_followup_request_started",
         "llm_final_request_started",
         "llm_followup_response_received",
@@ -246,6 +259,12 @@ def test_successful_one_tool_loop_emits_timeline_events() -> None:
     assert requested.metadata["argument_keys"] == ("a", "b")
     assert "15" not in repr(requested.metadata)
     assert events.by_type("tool_execution_completed")[0].metadata["output_preview"] == "42"
+    assert events.by_type("tool_execution_group_started")[0].metadata[
+        "execution_mode"
+    ] == "sequential"
+    assert events.by_type("tool_execution_group_completed")[0].metadata[
+        "successful_tool_count"
+    ] == 1
     completed = events.by_type("agent_tool_loop_completed")[0]
     assert completed.metadata["completed"] is True
     assert completed.metadata["reason"] == "completed"
@@ -325,6 +344,46 @@ def test_multiple_tool_calls_in_one_llm_response_then_final_response() -> None:
     assert provider.requests[1].messages[3].content == "54"
 
 
+def test_explicit_sequential_mode_preserves_multi_tool_result_order() -> None:
+    events = RuntimeEventLog()
+    registry = arithmetic_registry()
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                tool_call("call_add", arguments={"a": 15, "b": 27}),
+                tool_call(
+                    "call_multiply",
+                    name="multiply_numbers",
+                    arguments={"a": 6, "b": 9},
+                ),
+            ),
+            final_response("The sum is 42 and the product is 54."),
+        ]
+    )
+    loop = build_loop(
+        provider,
+        registry,
+        events,
+        AgentToolLoopConfig(tool_execution_mode="sequential"),
+    )
+
+    result = loop.run(
+        [{"role": "user", "content": "Use both arithmetic tools."}],
+        tools=[add_tool_definition(), multiply_tool_definition()],
+    )
+
+    assert result.completed is True
+    assert [tool_result.name for tool_result in result.tool_results] == [
+        "add_numbers",
+        "multiply_numbers",
+    ]
+    assert [tool_result.content for tool_result in result.tool_results] == ["42", "54"]
+    assert [
+        event.metadata["execution_mode"]
+        for event in events.by_type("tool_execution_completed")
+    ] == ["sequential", "sequential"]
+
+
 def test_multi_tool_loop_emits_timeline_events_per_tool_call() -> None:
     events = RuntimeEventLog()
     registry = ToolRegistry()
@@ -375,6 +434,20 @@ def test_multi_tool_loop_emits_timeline_events_per_tool_call() -> None:
         "42",
         "54",
     ]
+    group_started = events.by_type("tool_execution_group_started")
+    group_completed = events.by_type("tool_execution_group_completed")
+    assert len(group_started) == 1
+    assert len(group_completed) == 1
+    assert group_started[0].metadata["tool_call_count"] == 2
+    assert group_started[0].metadata["tool_names"] == (
+        "add_numbers",
+        "multiply_numbers",
+    )
+    assert group_started[0].metadata["execution_mode"] == "sequential"
+    assert group_completed[0].metadata["tool_call_count"] == 2
+    assert group_completed[0].metadata["successful_tool_count"] == 2
+    assert group_completed[0].metadata["failed_tool_count"] == 0
+    assert group_completed[0].metadata["execution_mode"] == "sequential"
 
 
 def test_multiple_sequential_tool_calls() -> None:
@@ -458,6 +531,14 @@ def test_multi_round_two_tool_loop_reaches_final_response() -> None:
         2,
     ]
     assert events.by_type("llm_final_response_received")[0].metadata["round_index"] == 2
+    assert [event.metadata["execution_mode"] for event in events.by_type("tool_execution_group_started")] == [
+        "sequential",
+        "sequential",
+    ]
+    assert [event.metadata["round_index"] for event in events.by_type("tool_execution_group_completed")] == [
+        0,
+        1,
+    ]
 
 
 def test_multi_round_max_steps_stops_before_unbounded_tool_execution() -> None:
@@ -516,6 +597,12 @@ def test_multi_round_tool_failure_preserves_existing_failure_semantics() -> None
     ]
     assert result.tool_results[-1].success is False
     assert events.by_type("tool_execution_failed")[0].metadata["round_index"] == 1
+    group_failure = events.by_type("tool_execution_group_failed")[0]
+    assert group_failure.metadata["execution_mode"] == "sequential"
+    assert group_failure.metadata["round_index"] == 1
+    assert group_failure.metadata["tool_call_count"] == 1
+    assert group_failure.metadata["successful_tool_count"] == 0
+    assert group_failure.metadata["failed_tool_count"] == 1
     assert events.by_type("agent_tool_loop_failed")[-1].metadata["reason"] == "tool_error"
 
 
@@ -621,6 +708,10 @@ def test_tool_failure_emits_failed_timeline_events_without_changing_semantics() 
     assert failure.metadata["error_type"] == "ToolValidationError"
     assert failure.metadata["error_category"] == "validation"
     assert "missing required argument: b" in failure.metadata["error_preview"]
+    group_failure = events.by_type("tool_execution_group_failed")[0]
+    assert group_failure.metadata["execution_mode"] == "sequential"
+    assert group_failure.metadata["tool_call_count"] == 1
+    assert group_failure.metadata["failed_tool_count"] == 1
 
 
 def test_stop_on_tool_error_true_does_not_execute_later_tool_calls() -> None:
@@ -812,3 +903,32 @@ def test_events_do_not_leak_prompts_arguments_or_keys() -> None:
     assert result_secret not in rendered_events
     assert "agent_tool_loop.tool_execution_started" in rendered_events
     assert "agent_tool_loop.tool_execution_completed" in rendered_events
+
+
+def test_unsupported_tool_execution_mode_fails_clearly() -> None:
+    try:
+        AgentToolLoopConfig(tool_execution_mode="parallel")  # type: ignore[arg-type]
+    except ValueError as exc:
+        assert str(exc) == (
+            "Unsupported tool_execution_mode: parallel. Supported modes: sequential."
+        )
+    else:
+        raise AssertionError("expected unsupported tool execution mode to fail")
+
+
+def test_unsupported_tool_execution_mode_run_override_fails_clearly() -> None:
+    provider = ScriptedProvider([final_response("done")])
+    loop = build_loop(provider, ToolRegistry())
+
+    try:
+        loop.run(
+            [{"role": "user", "content": "hello"}],
+            tools=[],
+            tool_execution_mode="nonsense",
+        )
+    except ValueError as exc:
+        assert str(exc) == (
+            "Unsupported tool_execution_mode: nonsense. Supported modes: sequential."
+        )
+    else:
+        raise AssertionError("expected unsupported tool execution mode to fail")

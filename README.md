@@ -540,17 +540,19 @@ Timeline:
 1. agent_tool_loop_started
 2. llm_request_started
 3. llm_response_received
-4. tool_call_requested add_numbers
-5. tool_execution_started add_numbers
-6. tool_execution_completed add_numbers
-7. tool_call_requested multiply_numbers
-8. tool_execution_started multiply_numbers
-9. tool_execution_completed multiply_numbers
-10. llm_followup_request_started
-11. llm_final_request_started final_attempt=False
-12. llm_followup_response_received
-13. llm_final_response_received
-14. agent_tool_loop_completed
+4. tool_execution_group_started execution_mode=sequential
+5. tool_call_requested add_numbers execution_mode=sequential
+6. tool_execution_started add_numbers execution_mode=sequential
+7. tool_execution_completed add_numbers execution_mode=sequential
+8. tool_call_requested multiply_numbers execution_mode=sequential
+9. tool_execution_started multiply_numbers execution_mode=sequential
+10. tool_execution_completed multiply_numbers execution_mode=sequential
+11. tool_execution_group_completed execution_mode=sequential
+12. llm_followup_request_started
+13. llm_final_request_started final_attempt=False
+14. llm_followup_response_received
+15. llm_final_response_received
+16. agent_tool_loop_completed
 ```
 
 These events matter because dashboard and demo users can inspect the verified
@@ -587,3 +589,27 @@ Sulcus OS can now supervise those cycles with structured timeline events such
 as `llm_followup_request_started`, `llm_followup_response_received`, and
 round-indexed tool execution events. Live provider smoke tests still require
 `AGENTOS_LLM_API_KEY`, and parallel tool execution remains future work.
+
+### Tool Execution Modes
+
+Step 39 makes tool execution mode explicit. Sulcus OS currently supports
+`tool_execution_mode="sequential"` only, and this remains the default for
+backwards-compatible behavior. Unsupported modes such as `"parallel"` fail
+clearly instead of silently falling back.
+
+The timeline now records execution mode on the loop start, tool execution
+groups, and per-tool execution events. This prepares the runtime for future
+parallel execution while preserving deterministic ordering today: in sequential
+mode, tool results are returned in the same order as the LLM requested them,
+including across multi-round runs.
+
+Mini example:
+
+```text
+Round 1: LLM requests add_numbers and multiply_numbers
+Sulcus OS emits tool_execution_group_started with execution_mode=sequential
+Sulcus OS executes add_numbers, then multiply_numbers
+Sulcus OS emits tool_execution_group_completed with execution_mode=sequential
+```
+
+Parallel execution remains future work.

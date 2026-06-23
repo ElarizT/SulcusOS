@@ -28,6 +28,7 @@ class ToolRegistry:
         parameters_schema: Mapping[str, Any],
         func: Callable[..., Any],
         timeout_seconds: float | None = None,
+        parallel_safe: bool = False,
         metadata: Mapping[str, Any] | None = None,
         overwrite: bool = False,
     ) -> ToolDefinition:
@@ -39,6 +40,7 @@ class ToolRegistry:
                 parameters_schema=parameters_schema,
                 func=func,
                 timeout_seconds=timeout_seconds,
+                parallel_safe=parallel_safe,
                 metadata=dict(metadata or {}),
             )
         except ValueError as exc:
@@ -92,6 +94,7 @@ class ToolRegistry:
                 "description": definition.description,
                 "parameters_schema": dict(definition.parameters_schema),
                 "timeout_seconds": definition.timeout_seconds,
+                "parallel_safe": definition.parallel_safe,
                 "metadata": dict(definition.metadata),
             }
             for definition in self.list()
@@ -110,6 +113,7 @@ class ToolRegistry:
                 {
                     "tool_name": definition.name,
                     "success": True,
+                    "parallel_safe": definition.parallel_safe,
                     "property_count": _property_count(definition.parameters_schema),
                     "required_count": _required_count(definition.parameters_schema),
                 },
