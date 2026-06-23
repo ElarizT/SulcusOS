@@ -1,4 +1,0 @@
-Create mode. 15-slide startup pitch deck for a non-technical co-founder.
-Palette: background #070B14, panel #101827, text #F7FAFC, muted #A9B8CC, accent #36D7FF.
-Fonts: Aptos Display for titles, Aptos for body. Dark modern infrastructure style.
-Object types: editable textboxes, shapes, lines/connectors, speaker notes.

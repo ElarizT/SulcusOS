@@ -1,5 +1,0 @@
-Visual QA completed by render export.
-Expected slides: 15.
-Style: dark background, white text, cyan accent, editable shape diagrams.
-Checked for concise slide copy and large visual hierarchy during construction.
-Caveat: visual inspection is based on generated previews saved in tmp/preview.
