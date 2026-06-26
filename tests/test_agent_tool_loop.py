@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from kernel.agent_tool_loop import AgentToolLoop, AgentToolLoopConfig
@@ -128,6 +129,8 @@ def add_registry(executions: list[tuple[float, float]] | None = None) -> ToolReg
 
 def arithmetic_registry(
     executions: list[tuple[str, float, float]] | None = None,
+    *,
+    parallel_safe: bool = False,
 ) -> ToolRegistry:
     registry = ToolRegistry()
 
@@ -146,12 +149,53 @@ def arithmetic_registry(
         description="Add two numbers.",
         parameters_schema=add_schema(),
         func=add_numbers,
+        parallel_safe=parallel_safe,
     )
     registry.register(
         name="multiply_numbers",
         description="Multiply two numbers.",
         parameters_schema=add_schema(),
         func=multiply_numbers,
+        parallel_safe=parallel_safe,
+    )
+    return registry
+
+
+def slow_parallel_arithmetic_registry() -> ToolRegistry:
+    registry = ToolRegistry()
+    schema = add_schema()
+    raw_properties = schema["properties"]
+    assert isinstance(raw_properties, dict)
+    properties = dict(raw_properties)
+    schema_with_delay = {
+        **schema,
+        "properties": {
+            **properties,
+            "delay_ms": {"type": "integer"},
+        },
+    }
+
+    def slow_add_numbers(a: float, b: float, delay_ms: int = 80) -> float:
+        time.sleep(delay_ms / 1000)
+        return a + b
+
+    def slow_multiply_numbers(a: float, b: float, delay_ms: int = 10) -> float:
+        time.sleep(delay_ms / 1000)
+        return a * b
+
+    registry.register(
+        name="slow_add_numbers",
+        description="Slowly add two numbers.",
+        parameters_schema=schema_with_delay,
+        func=slow_add_numbers,
+        parallel_safe=True,
+    )
+    registry.register(
+        name="slow_multiply_numbers",
+        description="Slowly multiply two numbers.",
+        parameters_schema=schema_with_delay,
+        func=slow_multiply_numbers,
+        parallel_safe=True,
     )
     return registry
 
@@ -382,6 +426,221 @@ def test_explicit_sequential_mode_preserves_multi_tool_result_order() -> None:
         event.metadata["execution_mode"]
         for event in events.by_type("tool_execution_completed")
     ] == ["sequential", "sequential"]
+
+
+def test_parallel_mode_with_safe_tools_preserves_request_order() -> None:
+    events = RuntimeEventLog()
+    registry = slow_parallel_arithmetic_registry()
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                tool_call(
+                    "call_slow_add",
+                    name="slow_add_numbers",
+                    arguments={"a": 20, "b": 22, "delay_ms": 80},
+                ),
+                tool_call(
+                    "call_fast_multiply",
+                    name="slow_multiply_numbers",
+                    arguments={"a": 6, "b": 7, "delay_ms": 10},
+                ),
+            ),
+            final_response("Both results are available."),
+        ]
+    )
+    loop = build_loop(
+        provider,
+        registry,
+        events,
+        AgentToolLoopConfig(tool_execution_mode="parallel"),
+    )
+
+    result = loop.run(
+        [{"role": "user", "content": "Use both slow arithmetic tools."}],
+        tools=registry.llm_tool_definitions(),
+    )
+
+    assert result.completed is True
+    assert [tool_result.name for tool_result in result.tool_results] == [
+        "slow_add_numbers",
+        "slow_multiply_numbers",
+    ]
+    assert [tool_result.content for tool_result in result.tool_results] == ["42", "42"]
+    group_started = events.by_type("tool_execution_group_started")[0]
+    assert group_started.metadata["requested_execution_mode"] == "parallel"
+    assert group_started.metadata["effective_execution_mode"] == "parallel"
+    assert group_started.metadata["execution_mode"] == "parallel"
+    assert group_started.metadata["parallel_safe_tool_count"] == 2
+    assert group_started.metadata["unsafe_tool_count"] == 0
+    assert "fallback_reason" not in group_started.metadata
+    assert [
+        message.metadata["name"] for message in provider.requests[1].messages[2:]
+    ] == ["slow_add_numbers", "slow_multiply_numbers"]
+    assert [message.content for message in provider.requests[1].messages[2:]] == [
+        "42",
+        "42",
+    ]
+
+
+def test_parallel_mode_falls_back_to_sequential_when_tool_is_not_safe() -> None:
+    events = RuntimeEventLog()
+    executions: list[tuple[str, float, float]] = []
+    registry = ToolRegistry()
+
+    def add_numbers(a: float, b: float) -> float:
+        executions.append(("add_numbers", a, b))
+        return a + b
+
+    def multiply_numbers(a: float, b: float) -> float:
+        executions.append(("multiply_numbers", a, b))
+        return a * b
+
+    registry.register(
+        name="add_numbers",
+        description="Add two numbers.",
+        parameters_schema=add_schema(),
+        func=add_numbers,
+        parallel_safe=True,
+    )
+    registry.register(
+        name="multiply_numbers",
+        description="Multiply two numbers.",
+        parameters_schema=add_schema(),
+        func=multiply_numbers,
+        parallel_safe=False,
+    )
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                tool_call("call_add", arguments={"a": 20, "b": 22}),
+                tool_call(
+                    "call_multiply",
+                    name="multiply_numbers",
+                    arguments={"a": 6, "b": 7},
+                ),
+            ),
+            final_response("The results are 42 and 42."),
+        ]
+    )
+    loop = build_loop(
+        provider,
+        registry,
+        events,
+        AgentToolLoopConfig(tool_execution_mode="parallel"),
+    )
+
+    result = loop.run(
+        [{"role": "user", "content": "Use both arithmetic tools."}],
+        tools=registry.llm_tool_definitions(),
+    )
+
+    assert result.completed is True
+    assert executions == [("add_numbers", 20, 22), ("multiply_numbers", 6, 7)]
+    assert [tool_result.content for tool_result in result.tool_results] == ["42", "42"]
+    group_started = events.by_type("tool_execution_group_started")[0]
+    assert group_started.metadata["requested_execution_mode"] == "parallel"
+    assert group_started.metadata["effective_execution_mode"] == "sequential"
+    assert group_started.metadata["execution_mode"] == "sequential"
+    assert group_started.metadata["fallback_reason"] == "not_all_tools_parallel_safe"
+    assert group_started.metadata["parallel_safe_tool_count"] == 1
+    assert group_started.metadata["unsafe_tool_count"] == 1
+
+
+def test_parallel_group_failure_collects_completed_tool_results() -> None:
+    events = RuntimeEventLog()
+    registry = ToolRegistry()
+    registry.register(
+        name="add_numbers",
+        description="Add two numbers.",
+        parameters_schema=add_schema(),
+        func=lambda a, b: a + b,
+        parallel_safe=True,
+    )
+    registry.register(
+        name="fail_numbers",
+        description="Fail while handling numbers.",
+        parameters_schema=add_schema(),
+        func=lambda a, b: (_ for _ in ()).throw(RuntimeError("boom")),
+        parallel_safe=True,
+    )
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                tool_call("call_add", arguments={"a": 20, "b": 22}),
+                tool_call(
+                    "call_fail",
+                    name="fail_numbers",
+                    arguments={"a": 6, "b": 7},
+                ),
+            )
+        ]
+    )
+    loop = build_loop(
+        provider,
+        registry,
+        events,
+        AgentToolLoopConfig(tool_execution_mode="parallel"),
+    )
+
+    result = loop.run(
+        [{"role": "user", "content": "Use both tools."}],
+        tools=registry.llm_tool_definitions(),
+    )
+
+    assert result.completed is False
+    assert result.reason == "tool_error"
+    assert [tool_result.name for tool_result in result.tool_results] == [
+        "add_numbers",
+        "fail_numbers",
+    ]
+    assert [tool_result.success for tool_result in result.tool_results] == [True, False]
+    assert "tool_execution_failed" in event_types(events)
+    group_failure = events.by_type("tool_execution_group_failed")[0]
+    assert group_failure.metadata["requested_execution_mode"] == "parallel"
+    assert group_failure.metadata["effective_execution_mode"] == "parallel"
+    assert group_failure.metadata["successful_tool_count"] == 1
+    assert group_failure.metadata["failed_tool_count"] == 1
+
+
+def test_multi_round_parallel_group_waits_before_next_llm_round() -> None:
+    events = RuntimeEventLog()
+    registry = slow_parallel_arithmetic_registry()
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                tool_call(
+                    "call_slow_add",
+                    name="slow_add_numbers",
+                    arguments={"a": 20, "b": 22, "delay_ms": 40},
+                ),
+                tool_call(
+                    "call_fast_multiply",
+                    name="slow_multiply_numbers",
+                    arguments={"a": 6, "b": 7, "delay_ms": 5},
+                ),
+            ),
+            final_response("The parallel group produced 42 and 42."),
+        ]
+    )
+    loop = build_loop(
+        provider,
+        registry,
+        events,
+        AgentToolLoopConfig(tool_execution_mode="parallel"),
+    )
+
+    result = loop.run(
+        [{"role": "user", "content": "Use both slow arithmetic tools."}],
+        tools=registry.llm_tool_definitions(),
+        max_steps=3,
+    )
+
+    assert result.completed is True
+    assert len(provider.requests) == 2
+    assert [tool_result.content for tool_result in result.tool_results] == ["42", "42"]
+    assert events.by_type("tool_execution_group_started")[0].metadata["round_index"] == 0
+    assert events.by_type("tool_execution_group_completed")[0].metadata["round_index"] == 0
+    assert events.by_type("llm_followup_request_started")[0].metadata["round_index"] == 1
 
 
 def test_multi_tool_loop_emits_timeline_events_per_tool_call() -> None:
@@ -905,12 +1164,19 @@ def test_events_do_not_leak_prompts_arguments_or_keys() -> None:
     assert "agent_tool_loop.tool_execution_completed" in rendered_events
 
 
+def test_parallel_tool_execution_mode_is_supported() -> None:
+    config = AgentToolLoopConfig(tool_execution_mode="parallel")
+
+    assert config.tool_execution_mode == "parallel"
+
+
 def test_unsupported_tool_execution_mode_fails_clearly() -> None:
     try:
-        AgentToolLoopConfig(tool_execution_mode="parallel")  # type: ignore[arg-type]
+        AgentToolLoopConfig(tool_execution_mode="nonsense")  # type: ignore[arg-type]
     except ValueError as exc:
         assert str(exc) == (
-            "Unsupported tool_execution_mode: parallel. Supported modes: sequential."
+            "Unsupported tool_execution_mode: nonsense. "
+            "Supported modes: sequential, parallel."
         )
     else:
         raise AssertionError("expected unsupported tool execution mode to fail")
@@ -928,7 +1194,8 @@ def test_unsupported_tool_execution_mode_run_override_fails_clearly() -> None:
         )
     except ValueError as exc:
         assert str(exc) == (
-            "Unsupported tool_execution_mode: nonsense. Supported modes: sequential."
+            "Unsupported tool_execution_mode: nonsense. "
+            "Supported modes: sequential, parallel."
         )
     else:
         raise AssertionError("expected unsupported tool execution mode to fail")

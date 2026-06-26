@@ -113,8 +113,13 @@ def test_timeline_formats_tool_execution_group_mode_metadata() -> None:
             "Tool execution group completed",
             {
                 "execution_mode": "sequential",
+                "requested_execution_mode": "parallel",
+                "effective_execution_mode": "sequential",
+                "fallback_reason": "not_all_tools_parallel_safe",
                 "round_index": 0,
                 "tool_call_count": 2,
+                "parallel_safe_tool_count": 1,
+                "unsafe_tool_count": 1,
                 "successful_tool_count": 2,
                 "failed_tool_count": 0,
                 "tool_names": ("add_numbers", "multiply_numbers"),
@@ -124,7 +129,12 @@ def test_timeline_formats_tool_execution_group_mode_metadata() -> None:
 
     assert "tool_execution_group_completed" in row
     assert "execution_mode=sequential" in row
+    assert "requested_execution_mode=parallel" in row
+    assert "effective_execution_mode=sequential" in row
+    assert "fallback_reason=not_all_tools_parallel_safe" in row
     assert "tool_call_count=2" in row
+    assert "parallel_safe_tool_count=1" in row
+    assert "unsafe_tool_count=1" in row
     assert "successful_tool_count=2" in row
     assert "failed_tool_count=0" in row
     assert "tool_names" not in row
