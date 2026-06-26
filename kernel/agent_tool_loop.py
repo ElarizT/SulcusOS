@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
@@ -23,8 +24,8 @@ from kernel.tools.types import ToolDefinition, ToolExecutionResult
 EventSink = Callable[[RuntimeEvent], None] | Any
 MessageInput = LLMMessage | Mapping[str, Any]
 ToolInput = LLMToolDefinition | ToolDefinition | Mapping[str, Any]
-ToolExecutionMode = Literal["sequential"]
-SUPPORTED_TOOL_EXECUTION_MODES: tuple[str, ...] = ("sequential",)
+ToolExecutionMode = Literal["sequential", "parallel"]
+SUPPORTED_TOOL_EXECUTION_MODES: tuple[str, ...] = ("sequential", "parallel")
 
 
 @dataclass(frozen=True)
@@ -117,6 +118,14 @@ class _ToolOutcome:
     success: bool
     error_type: str | None = None
     error_category: str | None = None
+
+
+@dataclass(frozen=True)
+class _ResolvedToolExecutionMode:
+    effective_execution_mode: ToolExecutionMode
+    fallback_reason: str | None
+    parallel_safe_tool_count: int
+    unsafe_tool_count: int
 
 
 class AgentToolLoop:
@@ -490,10 +499,17 @@ class AgentToolLoop:
                 *history,
                 assistant_tool_call_message(response),
             )
-            outcomes: list[_ToolOutcome] = []
-            executed_tool_calls: list[LLMToolCall] = []
+            resolved_mode = _resolve_tool_execution_group_mode(
+                requested_execution_mode=config.tool_execution_mode,
+                tool_calls=response.tool_calls,
+                registry=self.tool_runtime.registry,
+            )
             group_metadata = _tool_execution_group_metadata(
-                execution_mode=config.tool_execution_mode,
+                requested_execution_mode=config.tool_execution_mode,
+                effective_execution_mode=resolved_mode.effective_execution_mode,
+                fallback_reason=resolved_mode.fallback_reason,
+                parallel_safe_tool_count=resolved_mode.parallel_safe_tool_count,
+                unsafe_tool_count=resolved_mode.unsafe_tool_count,
                 step_index=step_index,
                 tool_calls=response.tool_calls,
                 provider=response.provider,
@@ -506,35 +522,24 @@ class AgentToolLoop:
                 "Agent tool loop tool execution group started",
                 group_metadata,
             )
-            for tool_call in response.tool_calls:
-                self._emit(
-                    "tool_call_requested",
-                    "Agent tool loop tool call requested",
-                    {
-                        "round_index": step_index,
-                        "step_index": step_index,
-                        "tool_call_id": tool_call.id,
-                        "tool_name": tool_call.name,
-                        "argument_keys": _argument_keys(tool_call.arguments),
-                        "execution_mode": config.tool_execution_mode,
-                        "provider": response.provider,
-                        "model": response.model,
-                    },
-                )
-                outcome = self._execute_tool_call(
-                    tool_call,
-                    allowed_tool_names=allowed_tool_names,
-                    step_index=step_index,
-                    max_steps=config.max_steps,
-                    execution_mode=config.tool_execution_mode,
-                    provider=response.provider,
-                    model=response.model,
-                )
-                outcomes.append(outcome)
-                executed_tool_calls.append(tool_call)
-                all_tool_results.append(outcome.llm_result)
-                if not outcome.success and config.stop_on_tool_error:
-                    break
+            outcomes = self._execute_tool_group(
+                response.tool_calls,
+                allowed_tool_names=allowed_tool_names,
+                step_index=step_index,
+                max_steps=config.max_steps,
+                requested_execution_mode=config.tool_execution_mode,
+                effective_execution_mode=resolved_mode.effective_execution_mode,
+                provider=response.provider,
+                model=response.model,
+                stop_on_tool_error=config.stop_on_tool_error,
+            )
+            executed_tool_calls = tuple(
+                tool_call
+                for tool_call, outcome in zip(response.tool_calls, outcomes)
+                if outcome is not None
+            )
+            outcomes = [outcome for outcome in outcomes if outcome is not None]
+            all_tool_results.extend(outcome.llm_result for outcome in outcomes)
 
             tool_results = tuple(outcome.llm_result for outcome in outcomes)
             failed_outcome = next(
@@ -544,7 +549,11 @@ class AgentToolLoop:
             successful_tool_count = sum(1 for outcome in outcomes if outcome.success)
             failed_tool_count = len(outcomes) - successful_tool_count
             completed_group_metadata = _tool_execution_group_metadata(
-                execution_mode=config.tool_execution_mode,
+                requested_execution_mode=config.tool_execution_mode,
+                effective_execution_mode=resolved_mode.effective_execution_mode,
+                fallback_reason=resolved_mode.fallback_reason,
+                parallel_safe_tool_count=resolved_mode.parallel_safe_tool_count,
+                unsafe_tool_count=resolved_mode.unsafe_tool_count,
                 step_index=step_index,
                 tool_calls=response.tool_calls,
                 provider=response.provider,
@@ -575,7 +584,7 @@ class AgentToolLoop:
                 AgentToolLoopStep(
                     index=step_index,
                     kind="tool_execution",
-                    tool_calls=tuple(executed_tool_calls),
+                    tool_calls=executed_tool_calls,
                     tool_results=tool_results,
                     success=failed_outcome is None,
                     error_type=None if failed_outcome is None else failed_outcome.error_type,
@@ -639,6 +648,198 @@ class AgentToolLoop:
             tool_results=all_tool_results,
         )
 
+    def _execute_tool_group(
+        self,
+        tool_calls: Sequence[LLMToolCall],
+        *,
+        allowed_tool_names: frozenset[str],
+        step_index: int,
+        max_steps: int,
+        requested_execution_mode: ToolExecutionMode,
+        effective_execution_mode: ToolExecutionMode,
+        provider: str,
+        model: str,
+        stop_on_tool_error: bool,
+    ) -> list[_ToolOutcome | None]:
+        if effective_execution_mode == "parallel":
+            return self._execute_tool_group_parallel(
+                tool_calls,
+                allowed_tool_names=allowed_tool_names,
+                step_index=step_index,
+                max_steps=max_steps,
+                requested_execution_mode=requested_execution_mode,
+                effective_execution_mode=effective_execution_mode,
+                provider=provider,
+                model=model,
+            )
+
+        outcomes: list[_ToolOutcome | None] = []
+        for tool_call in tool_calls:
+            self._emit(
+                "tool_call_requested",
+                "Agent tool loop tool call requested",
+                {
+                    "round_index": step_index,
+                    "step_index": step_index,
+                    "tool_call_id": tool_call.id,
+                    "tool_name": tool_call.name,
+                    "argument_keys": _argument_keys(tool_call.arguments),
+                    "execution_mode": effective_execution_mode,
+                    "requested_execution_mode": requested_execution_mode,
+                    "effective_execution_mode": effective_execution_mode,
+                    "provider": provider,
+                    "model": model,
+                },
+            )
+            outcome = self._execute_tool_call(
+                tool_call,
+                allowed_tool_names=allowed_tool_names,
+                step_index=step_index,
+                max_steps=max_steps,
+                requested_execution_mode=requested_execution_mode,
+                effective_execution_mode=effective_execution_mode,
+                provider=provider,
+                model=model,
+            )
+            outcomes.append(outcome)
+            if not outcome.success and stop_on_tool_error:
+                break
+        return outcomes
+
+    def _execute_tool_group_parallel(
+        self,
+        tool_calls: Sequence[LLMToolCall],
+        *,
+        allowed_tool_names: frozenset[str],
+        step_index: int,
+        max_steps: int,
+        requested_execution_mode: ToolExecutionMode,
+        effective_execution_mode: ToolExecutionMode,
+        provider: str,
+        model: str,
+    ) -> list[_ToolOutcome | None]:
+        outcomes: list[_ToolOutcome | None] = [None] * len(tool_calls)
+        for tool_call in tool_calls:
+            self._emit(
+                "tool_call_requested",
+                "Agent tool loop tool call requested",
+                {
+                    "round_index": step_index,
+                    "step_index": step_index,
+                    "tool_call_id": tool_call.id,
+                    "tool_name": tool_call.name,
+                    "argument_keys": _argument_keys(tool_call.arguments),
+                    "execution_mode": effective_execution_mode,
+                    "requested_execution_mode": requested_execution_mode,
+                    "effective_execution_mode": effective_execution_mode,
+                    "provider": provider,
+                    "model": model,
+                },
+            )
+
+        with ThreadPoolExecutor(max_workers=len(tool_calls)) as executor:
+            futures = [
+                executor.submit(
+                    self._execute_tool_call,
+                    tool_call,
+                    allowed_tool_names=allowed_tool_names,
+                    step_index=step_index,
+                    max_steps=max_steps,
+                    requested_execution_mode=requested_execution_mode,
+                    effective_execution_mode=effective_execution_mode,
+                    provider=provider,
+                    model=model,
+                )
+                for tool_call in tool_calls
+            ]
+            for index, future in enumerate(futures):
+                try:
+                    outcomes[index] = future.result()
+                except Exception as exc:
+                    tool_call = tool_calls[index]
+                    outcome = _failed_tool_outcome(
+                        tool_call,
+                        error_type=exc.__class__.__name__,
+                        error_category="execution_error",
+                        error="Tool execution failed",
+                    )
+                    self._emit_tool_outcome(
+                        tool_call,
+                        outcome,
+                        step_index=step_index,
+                        max_steps=max_steps,
+                        requested_execution_mode=requested_execution_mode,
+                        effective_execution_mode=effective_execution_mode,
+                        provider=provider,
+                        model=model,
+                    )
+                    outcomes[index] = outcome
+        return outcomes
+
+    def _emit_tool_outcome(
+        self,
+        tool_call: LLMToolCall,
+        outcome: _ToolOutcome,
+        *,
+        step_index: int,
+        max_steps: int,
+        requested_execution_mode: ToolExecutionMode,
+        effective_execution_mode: ToolExecutionMode,
+        provider: str,
+        model: str,
+    ) -> None:
+        event_type = (
+            "agent_tool_loop.tool_execution_completed"
+            if outcome.success
+            else "agent_tool_loop.tool_execution_failed"
+        )
+        metadata = {
+            "round_index": step_index,
+            "step_index": step_index,
+            "max_steps": max_steps,
+            "tool_call_id": tool_call.id,
+            "tool_name": tool_call.name,
+            "execution_mode": effective_execution_mode,
+            "requested_execution_mode": requested_execution_mode,
+            "effective_execution_mode": effective_execution_mode,
+            "success": outcome.success,
+            "provider": provider,
+            "model": model,
+            **_tool_result_preview_metadata(outcome.llm_result),
+            **_safe_error_metadata(outcome.error_type, outcome.error_category),
+        }
+        self._emit(
+            "tool_execution_completed" if outcome.success else "tool_execution_failed",
+            (
+                "Agent tool loop tool execution completed"
+                if outcome.success
+                else "Agent tool loop tool execution failed"
+            ),
+            metadata,
+            error=not outcome.success,
+        )
+        self._emit(
+            event_type,
+            (
+                "Agent tool loop tool execution completed"
+                if outcome.success
+                else "Agent tool loop tool execution failed"
+            ),
+            {
+                "step_index": step_index,
+                "max_steps": max_steps,
+                "tool_name": tool_call.name,
+                "execution_mode": effective_execution_mode,
+                "requested_execution_mode": requested_execution_mode,
+                "effective_execution_mode": effective_execution_mode,
+                "success": outcome.success,
+                "provider": provider,
+                "model": model,
+                **_safe_error_metadata(outcome.error_type, outcome.error_category),
+            },
+            error=not outcome.success,
+        )
+
     def _execute_tool_call(
         self,
         tool_call: LLMToolCall,
@@ -646,7 +847,8 @@ class AgentToolLoop:
         allowed_tool_names: frozenset[str],
         step_index: int,
         max_steps: int,
-        execution_mode: ToolExecutionMode,
+        requested_execution_mode: ToolExecutionMode,
+        effective_execution_mode: ToolExecutionMode,
         provider: str,
         model: str,
     ) -> _ToolOutcome:
@@ -659,7 +861,9 @@ class AgentToolLoop:
                 "max_steps": max_steps,
                 "tool_call_id": tool_call.id,
                 "tool_name": tool_call.name,
-                "execution_mode": execution_mode,
+                "execution_mode": effective_execution_mode,
+                "requested_execution_mode": requested_execution_mode,
+                "effective_execution_mode": effective_execution_mode,
                 "success": False,
                 "provider": provider,
                 "model": model,
@@ -672,7 +876,9 @@ class AgentToolLoop:
                 "step_index": step_index,
                 "max_steps": max_steps,
                 "tool_name": tool_call.name,
-                "execution_mode": execution_mode,
+                "execution_mode": effective_execution_mode,
+                "requested_execution_mode": requested_execution_mode,
+                "effective_execution_mode": effective_execution_mode,
                 "success": False,
                 "provider": provider,
                 "model": model,
@@ -699,51 +905,15 @@ class AgentToolLoop:
             else:
                 outcome = _outcome_from_execution_result(execution_result)
 
-        event_type = (
-            "agent_tool_loop.tool_execution_completed"
-            if outcome.success
-            else "agent_tool_loop.tool_execution_failed"
-        )
-        self._emit(
-            "tool_execution_completed" if outcome.success else "tool_execution_failed",
-            (
-                "Agent tool loop tool execution completed"
-                if outcome.success
-                else "Agent tool loop tool execution failed"
-            ),
-            {
-                "round_index": step_index,
-                "step_index": step_index,
-                "max_steps": max_steps,
-                "tool_call_id": tool_call.id,
-                "tool_name": tool_call.name,
-                "execution_mode": execution_mode,
-                "success": outcome.success,
-                "provider": provider,
-                "model": model,
-                **_tool_result_preview_metadata(outcome.llm_result),
-                **_safe_error_metadata(outcome.error_type, outcome.error_category),
-            },
-            error=not outcome.success,
-        )
-        self._emit(
-            event_type,
-            (
-                "Agent tool loop tool execution completed"
-                if outcome.success
-                else "Agent tool loop tool execution failed"
-            ),
-            {
-                "step_index": step_index,
-                "max_steps": max_steps,
-                "tool_name": tool_call.name,
-                "execution_mode": execution_mode,
-                "success": outcome.success,
-                "provider": provider,
-                "model": model,
-                **_safe_error_metadata(outcome.error_type, outcome.error_category),
-            },
-            error=not outcome.success,
+        self._emit_tool_outcome(
+            tool_call,
+            outcome,
+            step_index=step_index,
+            max_steps=max_steps,
+            requested_execution_mode=requested_execution_mode,
+            effective_execution_mode=effective_execution_mode,
+            provider=provider,
+            model=model,
         )
         return outcome
 
@@ -976,6 +1146,7 @@ def _failed_tool_outcome(
     *,
     error_type: str,
     error_category: str,
+    error: str = "Tool execution rejected",
 ) -> _ToolOutcome:
     return _ToolOutcome(
         llm_result=LLMToolResult(
@@ -983,7 +1154,7 @@ def _failed_tool_outcome(
             name=tool_call.name,
             content="",
             success=False,
-            error="Tool execution rejected",
+            error=error,
         ),
         success=False,
         error_type=error_type,
@@ -995,9 +1166,48 @@ def _tool_names(tool_calls: Sequence[LLMToolCall]) -> tuple[str, ...]:
     return tuple(tool_call.name for tool_call in tool_calls)
 
 
+def _resolve_tool_execution_group_mode(
+    *,
+    requested_execution_mode: ToolExecutionMode,
+    tool_calls: Sequence[LLMToolCall],
+    registry: Any,
+) -> _ResolvedToolExecutionMode:
+    parallel_safe_tool_count = 0
+    unsafe_tool_count = 0
+    for tool_call in tool_calls:
+        definition = registry.get(tool_call.name)
+        if definition is not None and definition.parallel_safe:
+            parallel_safe_tool_count += 1
+        else:
+            unsafe_tool_count += 1
+
+    if requested_execution_mode == "parallel" and unsafe_tool_count == 0:
+        return _ResolvedToolExecutionMode(
+            effective_execution_mode="parallel",
+            fallback_reason=None,
+            parallel_safe_tool_count=parallel_safe_tool_count,
+            unsafe_tool_count=unsafe_tool_count,
+        )
+
+    return _ResolvedToolExecutionMode(
+        effective_execution_mode="sequential",
+        fallback_reason=(
+            "not_all_tools_parallel_safe"
+            if requested_execution_mode == "parallel" and unsafe_tool_count > 0
+            else None
+        ),
+        parallel_safe_tool_count=parallel_safe_tool_count,
+        unsafe_tool_count=unsafe_tool_count,
+    )
+
+
 def _tool_execution_group_metadata(
     *,
-    execution_mode: ToolExecutionMode,
+    requested_execution_mode: ToolExecutionMode,
+    effective_execution_mode: ToolExecutionMode,
+    fallback_reason: str | None,
+    parallel_safe_tool_count: int,
+    unsafe_tool_count: int,
     step_index: int,
     tool_calls: Sequence[LLMToolCall],
     provider: str,
@@ -1005,17 +1215,24 @@ def _tool_execution_group_metadata(
     successful_tool_count: int,
     failed_tool_count: int,
 ) -> dict[str, Any]:
-    return {
-        "execution_mode": execution_mode,
+    metadata: dict[str, Any] = {
+        "execution_mode": effective_execution_mode,
+        "requested_execution_mode": requested_execution_mode,
+        "effective_execution_mode": effective_execution_mode,
         "round_index": step_index,
         "step_index": step_index,
         "tool_call_count": len(tool_calls),
         "tool_names": _tool_names(tool_calls),
+        "parallel_safe_tool_count": parallel_safe_tool_count,
+        "unsafe_tool_count": unsafe_tool_count,
         "successful_tool_count": successful_tool_count,
         "failed_tool_count": failed_tool_count,
         "provider": provider,
         "model": model,
     }
+    if fallback_reason is not None:
+        metadata["fallback_reason"] = fallback_reason
+    return metadata
 
 
 def _safe_request_route_metadata(

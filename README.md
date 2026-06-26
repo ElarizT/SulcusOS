@@ -590,26 +590,52 @@ as `llm_followup_request_started`, `llm_followup_response_received`, and
 round-indexed tool execution events. Live provider smoke tests still require
 `AGENTOS_LLM_API_KEY`, and parallel tool execution remains future work.
 
-### Tool Execution Modes
+### Parallel Tool Execution
 
-Step 39 makes tool execution mode explicit. Sulcus OS currently supports
-`tool_execution_mode="sequential"` only, and this remains the default for
-backwards-compatible behavior. Unsupported modes such as `"parallel"` fail
-clearly instead of silently falling back.
+Sequential execution remains the default. Set
+`tool_execution_mode="parallel"` to request group-level parallel execution
+within one LLM response:
 
-The timeline now records execution mode on the loop start, tool execution
-groups, and per-tool execution events. This prepares the runtime for future
-parallel execution while preserving deterministic ordering today: in sequential
-mode, tool results are returned in the same order as the LLM requested them,
-including across multi-round runs.
+```python
+config = AgentToolLoopConfig(tool_execution_mode="parallel")
+```
+
+Sulcus OS only executes a tool-call group concurrently when every requested
+tool is registered with `parallel_safe=True`. If any requested tool is missing
+from the registry or is not marked parallel-safe, the group safely falls back to
+sequential execution with
+`fallback_reason="not_all_tools_parallel_safe"`.
+
+The timeline exposes both requested and effective execution mode on group and
+per-tool events:
+
+- `requested_execution_mode`
+- `effective_execution_mode`
+- `fallback_reason`, when a parallel request falls back
+- `parallel_safe_tool_count`
+- `unsafe_tool_count`
+
+The legacy `execution_mode` metadata key is preserved and reflects the
+effective mode. Tool result order remains deterministic: `result.tool_results`
+and the tool messages sent to the next LLM round follow the original LLM
+tool-call order even if parallel tools finish out of order.
+
+Parallel execution is currently scoped to one tool-call group from a single LLM
+response. Multi-round execution still waits for all results from the current
+group before making the next LLM call. Live provider smoke tests still require
+`AGENTOS_LLM_API_KEY`.
+
+Run the offline deterministic parallel demo:
+
+```powershell
+python examples/agent_tool_loop_parallel_tool_demo.py
+```
 
 Mini example:
 
 ```text
 Round 1: LLM requests add_numbers and multiply_numbers
-Sulcus OS emits tool_execution_group_started with execution_mode=sequential
-Sulcus OS executes add_numbers, then multiply_numbers
-Sulcus OS emits tool_execution_group_completed with execution_mode=sequential
+Sulcus OS emits tool_execution_group_started with requested=parallel effective=parallel
+Sulcus OS executes both calls concurrently when both tools are parallel-safe
+Sulcus OS emits tool_execution_group_completed with deterministic result order
 ```
-
-Parallel execution remains future work.
