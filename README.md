@@ -639,3 +639,53 @@ Sulcus OS emits tool_execution_group_started with requested=parallel effective=p
 Sulcus OS executes both calls concurrently when both tools are parallel-safe
 Sulcus OS emits tool_execution_group_completed with deterministic result order
 ```
+
+### Tool Permission Policies
+
+By default, the Agent Tool Loop remains permissive for backwards compatibility.
+If no policy is configured, registered tools advertised to the run behave as
+they did before. A `ToolPermissionPolicy` can make tool access explicit with an
+allowlist, a denylist, or both:
+
+```python
+from kernel.agent_tool_loop import AgentToolLoopConfig, ToolPermissionPolicy
+
+permissive = ToolPermissionPolicy()
+
+allowlist = ToolPermissionPolicy(
+    default_allow=False,
+    allowed_tools={"add_numbers"},
+)
+
+denylist = ToolPermissionPolicy(
+    default_allow=True,
+    denied_tools={"delete_file"},
+)
+
+config = AgentToolLoopConfig(tool_permission_policy=allowlist)
+```
+
+Policy semantics are intentionally small:
+
+- `default_allow=True` allows every tool unless it appears in `denied_tools`.
+- `default_allow=False` allows only tools listed in `allowed_tools`.
+- `denied_tools` always wins over `allowed_tools`.
+- Policies apply across all rounds and all execution modes.
+
+Denied calls are represented as normal failed tool results with an error such
+as `Tool call denied by permission policy: multiply_numbers`. The denied tool
+function is not executed, and Sulcus OS emits `tool_call_denied` after the
+usual `tool_call_requested` event. Group failure metadata includes
+`failed_tool_count` and `denied_tool_count`, while loop start metadata includes
+a safe policy summary: `tool_policy_enabled`, `policy_default_allow`,
+`allowed_tool_count`, and `denied_tool_count`.
+
+In parallel mode, denied tools are never submitted to the executor. Allowed
+tools in the same group keep the existing parallel behavior and deterministic
+result ordering; the group is marked failed if any tool call was denied.
+
+Run the offline deterministic permission demo:
+
+```powershell
+python examples/agent_tool_loop_tool_permission_demo.py
+```

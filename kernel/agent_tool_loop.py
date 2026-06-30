@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from typing import Any, Literal
@@ -29,6 +29,52 @@ SUPPORTED_TOOL_EXECUTION_MODES: tuple[str, ...] = ("sequential", "parallel")
 
 
 @dataclass(frozen=True)
+class ToolPermissionPolicy:
+    """Allow or deny tool calls before execution.
+
+    Deny rules always win. With the default permissive policy, all tools are
+    allowed unless explicitly denied.
+    """
+
+    allowed_tools: frozenset[str] | None = None
+    denied_tools: frozenset[str] | None = None
+    default_allow: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.default_allow, bool):
+            raise ValueError("default_allow must be a boolean")
+        object.__setattr__(
+            self,
+            "allowed_tools",
+            _coerce_policy_tool_names(self.allowed_tools, "allowed_tools"),
+        )
+        object.__setattr__(
+            self,
+            "denied_tools",
+            _coerce_policy_tool_names(self.denied_tools, "denied_tools"),
+        )
+
+    def check(self, tool_name: str) -> "ToolPermissionDecision":
+        """Return whether a tool name is allowed and which rule matched."""
+        if tool_name in self.denied_tools:
+            return ToolPermissionDecision(False, "denied_tools", self.default_allow)
+        if self.default_allow:
+            return ToolPermissionDecision(True, None, self.default_allow)
+        if tool_name in self.allowed_tools:
+            return ToolPermissionDecision(True, None, self.default_allow)
+        return ToolPermissionDecision(False, "not_in_allowed_tools", self.default_allow)
+
+
+@dataclass(frozen=True)
+class ToolPermissionDecision:
+    """Result of checking one tool call against a permission policy."""
+
+    allowed: bool
+    matched_rule: str | None = None
+    policy_default_allow: bool = True
+
+
+@dataclass(frozen=True)
 class AgentToolLoopConfig:
     """Conservative controls for bounded LLM-tool orchestration.
 
@@ -42,6 +88,7 @@ class AgentToolLoopConfig:
     allow_parallel_tool_calls: bool = False
     tool_execution_mode: ToolExecutionMode = "sequential"
     include_intermediate_steps: bool = True
+    tool_permission_policy: ToolPermissionPolicy | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -59,6 +106,11 @@ class AgentToolLoopConfig:
             if not isinstance(getattr(self, field_name), bool):
                 raise ValueError(f"{field_name} must be a boolean")
         _validate_tool_execution_mode(self.tool_execution_mode)
+        if self.tool_permission_policy is not None and not isinstance(
+            self.tool_permission_policy,
+            ToolPermissionPolicy,
+        ):
+            raise ValueError("tool_permission_policy must be a ToolPermissionPolicy")
 
 
 @dataclass(frozen=True)
@@ -118,6 +170,7 @@ class _ToolOutcome:
     success: bool
     error_type: str | None = None
     error_category: str | None = None
+    denied: bool = False
 
 
 @dataclass(frozen=True)
@@ -169,6 +222,7 @@ class AgentToolLoop:
         allow_parallel_tool_calls: bool | None = None,
         tool_execution_mode: ToolExecutionMode | str | None = None,
         include_intermediate_steps: bool | None = None,
+        tool_permission_policy: ToolPermissionPolicy | None = None,
     ) -> AgentToolLoopResult:
         """Run a bounded explicit LLM -> tool -> LLM loop."""
         config = _resolve_config(
@@ -179,6 +233,7 @@ class AgentToolLoop:
             allow_parallel_tool_calls=allow_parallel_tool_calls,
             tool_execution_mode=tool_execution_mode,
             include_intermediate_steps=include_intermediate_steps,
+            tool_permission_policy=tool_permission_policy,
         )
         if config.allow_parallel_tool_calls:
             raise ValueError("parallel tool calls are not supported yet")
@@ -186,6 +241,8 @@ class AgentToolLoop:
         history = tuple(_coerce_message(message) for message in messages)
         tool_definitions = self._coerce_tool_definitions(tools)
         allowed_tool_names = frozenset(tool.name for tool in tool_definitions)
+        permission_policy = config.tool_permission_policy or ToolPermissionPolicy()
+        policy_summary = _tool_permission_policy_summary(config.tool_permission_policy)
         route_metadata = _runtime_route_metadata(self.llm_runtime, provider, model)
         steps: list[AgentToolLoopStep] = []
         all_tool_results: list[LLMToolResult] = []
@@ -201,6 +258,7 @@ class AgentToolLoop:
                 "execution_mode": config.tool_execution_mode,
                 "tool_count": len(tool_definitions),
                 "tool_names": tuple(tool.name for tool in tool_definitions),
+                **policy_summary,
                 **route_metadata,
                 **_agent_metadata(metadata),
             },
@@ -499,9 +557,19 @@ class AgentToolLoop:
                 *history,
                 assistant_tool_call_message(response),
             )
+            permission_decisions = tuple(
+                permission_policy.check(tool_call.name)
+                for tool_call in response.tool_calls
+            )
+            permitted_tool_calls = tuple(
+                tool_call
+                for tool_call, decision in zip(response.tool_calls, permission_decisions)
+                if decision.allowed
+            )
+            denied_tool_count = len(response.tool_calls) - len(permitted_tool_calls)
             resolved_mode = _resolve_tool_execution_group_mode(
                 requested_execution_mode=config.tool_execution_mode,
-                tool_calls=response.tool_calls,
+                tool_calls=permitted_tool_calls,
                 registry=self.tool_runtime.registry,
             )
             group_metadata = _tool_execution_group_metadata(
@@ -516,6 +584,7 @@ class AgentToolLoop:
                 model=response.model,
                 successful_tool_count=0,
                 failed_tool_count=0,
+                denied_tool_count=denied_tool_count,
             )
             self._emit(
                 "tool_execution_group_started",
@@ -525,6 +594,7 @@ class AgentToolLoop:
             outcomes = self._execute_tool_group(
                 response.tool_calls,
                 allowed_tool_names=allowed_tool_names,
+                permission_decisions=permission_decisions,
                 step_index=step_index,
                 max_steps=config.max_steps,
                 requested_execution_mode=config.tool_execution_mode,
@@ -548,6 +618,7 @@ class AgentToolLoop:
             )
             successful_tool_count = sum(1 for outcome in outcomes if outcome.success)
             failed_tool_count = len(outcomes) - successful_tool_count
+            denied_tool_count = sum(1 for outcome in outcomes if outcome.denied)
             completed_group_metadata = _tool_execution_group_metadata(
                 requested_execution_mode=config.tool_execution_mode,
                 effective_execution_mode=resolved_mode.effective_execution_mode,
@@ -560,6 +631,7 @@ class AgentToolLoop:
                 model=response.model,
                 successful_tool_count=successful_tool_count,
                 failed_tool_count=failed_tool_count,
+                denied_tool_count=denied_tool_count,
             )
             if failed_outcome is None:
                 self._emit(
@@ -653,6 +725,7 @@ class AgentToolLoop:
         tool_calls: Sequence[LLMToolCall],
         *,
         allowed_tool_names: frozenset[str],
+        permission_decisions: Sequence[ToolPermissionDecision],
         step_index: int,
         max_steps: int,
         requested_execution_mode: ToolExecutionMode,
@@ -665,6 +738,7 @@ class AgentToolLoop:
             return self._execute_tool_group_parallel(
                 tool_calls,
                 allowed_tool_names=allowed_tool_names,
+                permission_decisions=permission_decisions,
                 step_index=step_index,
                 max_steps=max_steps,
                 requested_execution_mode=requested_execution_mode,
@@ -674,7 +748,7 @@ class AgentToolLoop:
             )
 
         outcomes: list[_ToolOutcome | None] = []
-        for tool_call in tool_calls:
+        for tool_call, permission_decision in zip(tool_calls, permission_decisions):
             self._emit(
                 "tool_call_requested",
                 "Agent tool loop tool call requested",
@@ -691,16 +765,28 @@ class AgentToolLoop:
                     "model": model,
                 },
             )
-            outcome = self._execute_tool_call(
-                tool_call,
-                allowed_tool_names=allowed_tool_names,
-                step_index=step_index,
-                max_steps=max_steps,
-                requested_execution_mode=requested_execution_mode,
-                effective_execution_mode=effective_execution_mode,
-                provider=provider,
-                model=model,
-            )
+            if permission_decision.allowed:
+                outcome = self._execute_tool_call(
+                    tool_call,
+                    allowed_tool_names=allowed_tool_names,
+                    step_index=step_index,
+                    max_steps=max_steps,
+                    requested_execution_mode=requested_execution_mode,
+                    effective_execution_mode=effective_execution_mode,
+                    provider=provider,
+                    model=model,
+                )
+            else:
+                outcome = self._deny_tool_call(
+                    tool_call,
+                    permission_decision,
+                    step_index=step_index,
+                    max_steps=max_steps,
+                    requested_execution_mode=requested_execution_mode,
+                    effective_execution_mode=effective_execution_mode,
+                    provider=provider,
+                    model=model,
+                )
             outcomes.append(outcome)
             if not outcome.success and stop_on_tool_error:
                 break
@@ -711,6 +797,7 @@ class AgentToolLoop:
         tool_calls: Sequence[LLMToolCall],
         *,
         allowed_tool_names: frozenset[str],
+        permission_decisions: Sequence[ToolPermissionDecision],
         step_index: int,
         max_steps: int,
         requested_execution_mode: ToolExecutionMode,
@@ -737,12 +824,16 @@ class AgentToolLoop:
                 },
             )
 
-        with ThreadPoolExecutor(max_workers=len(tool_calls)) as executor:
-            futures = [
-                executor.submit(
-                    self._execute_tool_call,
+        permitted_calls: list[tuple[int, LLMToolCall]] = []
+        for index, (tool_call, permission_decision) in enumerate(
+            zip(tool_calls, permission_decisions)
+        ):
+            if permission_decision.allowed:
+                permitted_calls.append((index, tool_call))
+            else:
+                outcomes[index] = self._deny_tool_call(
                     tool_call,
-                    allowed_tool_names=allowed_tool_names,
+                    permission_decision,
                     step_index=step_index,
                     max_steps=max_steps,
                     requested_execution_mode=requested_execution_mode,
@@ -750,9 +841,29 @@ class AgentToolLoop:
                     provider=provider,
                     model=model,
                 )
-                for tool_call in tool_calls
+
+        if not permitted_calls:
+            return outcomes
+
+        with ThreadPoolExecutor(max_workers=len(permitted_calls)) as executor:
+            futures = [
+                (
+                    index,
+                    executor.submit(
+                        self._execute_tool_call,
+                        tool_call,
+                        allowed_tool_names=allowed_tool_names,
+                        step_index=step_index,
+                        max_steps=max_steps,
+                        requested_execution_mode=requested_execution_mode,
+                        effective_execution_mode=effective_execution_mode,
+                        provider=provider,
+                        model=model,
+                    ),
+                )
+                for index, tool_call in permitted_calls
             ]
-            for index, future in enumerate(futures):
+            for index, future in futures:
                 try:
                     outcomes[index] = future.result()
                 except Exception as exc:
@@ -775,6 +886,45 @@ class AgentToolLoop:
                     )
                     outcomes[index] = outcome
         return outcomes
+
+    def _deny_tool_call(
+        self,
+        tool_call: LLMToolCall,
+        permission_decision: ToolPermissionDecision,
+        *,
+        step_index: int,
+        max_steps: int,
+        requested_execution_mode: ToolExecutionMode,
+        effective_execution_mode: ToolExecutionMode,
+        provider: str,
+        model: str,
+    ) -> _ToolOutcome:
+        matched_rule = permission_decision.matched_rule or "permission_policy"
+        outcome = _permission_denied_tool_outcome(tool_call)
+        self._emit(
+            "tool_call_denied",
+            "Agent tool loop tool call denied",
+            {
+                "round_index": step_index,
+                "step_index": step_index,
+                "max_steps": max_steps,
+                "tool_call_id": tool_call.id,
+                "tool_name": tool_call.name,
+                "reason": "permission_policy",
+                "requested_execution_mode": requested_execution_mode,
+                "effective_execution_mode": effective_execution_mode,
+                "execution_mode": effective_execution_mode,
+                "policy_default_allow": permission_decision.policy_default_allow,
+                "matched_rule": matched_rule,
+                "success": False,
+                "provider": provider,
+                "model": model,
+                **_tool_result_preview_metadata(outcome.llm_result),
+                **_safe_error_metadata(outcome.error_type, outcome.error_category),
+            },
+            error=True,
+        )
+        return outcome
 
     def _emit_tool_outcome(
         self,
@@ -1077,6 +1227,7 @@ def _resolve_config(
     allow_parallel_tool_calls: bool | None,
     tool_execution_mode: ToolExecutionMode | str | None,
     include_intermediate_steps: bool | None,
+    tool_permission_policy: ToolPermissionPolicy | None,
 ) -> AgentToolLoopConfig:
     replacements: dict[str, Any] = {}
     if max_steps is not None:
@@ -1091,6 +1242,8 @@ def _resolve_config(
         replacements["tool_execution_mode"] = tool_execution_mode
     if include_intermediate_steps is not None:
         replacements["include_intermediate_steps"] = include_intermediate_steps
+    if tool_permission_policy is not None:
+        replacements["tool_permission_policy"] = tool_permission_policy
     return replace(config, **replacements) if replacements else config
 
 
@@ -1100,6 +1253,25 @@ def _validate_tool_execution_mode(mode: str) -> None:
         raise ValueError(
             f"Unsupported tool_execution_mode: {mode}. Supported modes: {supported}."
         )
+
+
+def _coerce_policy_tool_names(
+    tool_names: Iterable[str] | None,
+    field_name: str,
+) -> frozenset[str]:
+    if tool_names is None:
+        return frozenset()
+    if isinstance(tool_names, (str, bytes)):
+        raise ValueError(f"{field_name} must be an iterable of tool names")
+    values: list[str] = []
+    for tool_name in tool_names:
+        if not isinstance(tool_name, str) or not tool_name.strip():
+            raise ValueError(f"{field_name} must contain nonempty strings")
+        normalized = tool_name.strip()
+        if normalized != tool_name:
+            raise ValueError(f"{field_name} tool names must not contain whitespace")
+        values.append(tool_name)
+    return frozenset(values)
 
 
 def _coerce_message(message: MessageInput) -> LLMMessage:
@@ -1162,6 +1334,22 @@ def _failed_tool_outcome(
     )
 
 
+def _permission_denied_tool_outcome(tool_call: LLMToolCall) -> _ToolOutcome:
+    return _ToolOutcome(
+        llm_result=LLMToolResult(
+            tool_call_id=tool_call.id,
+            name=tool_call.name,
+            content="",
+            success=False,
+            error=f"Tool call denied by permission policy: {tool_call.name}",
+        ),
+        success=False,
+        error_type="ToolPermissionDeniedError",
+        error_category="permission_policy",
+        denied=True,
+    )
+
+
 def _tool_names(tool_calls: Sequence[LLMToolCall]) -> tuple[str, ...]:
     return tuple(tool_call.name for tool_call in tool_calls)
 
@@ -1214,6 +1402,7 @@ def _tool_execution_group_metadata(
     model: str,
     successful_tool_count: int,
     failed_tool_count: int,
+    denied_tool_count: int = 0,
 ) -> dict[str, Any]:
     metadata: dict[str, Any] = {
         "execution_mode": effective_execution_mode,
@@ -1227,6 +1416,7 @@ def _tool_execution_group_metadata(
         "unsafe_tool_count": unsafe_tool_count,
         "successful_tool_count": successful_tool_count,
         "failed_tool_count": failed_tool_count,
+        "denied_tool_count": denied_tool_count,
         "provider": provider,
         "model": model,
     }
@@ -1245,6 +1435,18 @@ def _safe_request_route_metadata(
     if isinstance(model, str) and model.strip():
         metadata["model"] = model
     return metadata
+
+
+def _tool_permission_policy_summary(
+    policy: ToolPermissionPolicy | None,
+) -> dict[str, int | bool]:
+    effective_policy = policy or ToolPermissionPolicy()
+    return {
+        "tool_policy_enabled": policy is not None,
+        "policy_default_allow": effective_policy.default_allow,
+        "allowed_tool_count": len(effective_policy.allowed_tools),
+        "denied_tool_count": len(effective_policy.denied_tools),
+    }
 
 
 def _runtime_route_metadata(

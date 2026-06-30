@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from kernel.agent_tool_loop import AgentToolLoop, AgentToolLoopConfig
+from kernel.agent_tool_loop import AgentToolLoop, AgentToolLoopConfig, ToolPermissionPolicy
 from kernel.events import RuntimeEventLog
 from kernel.llm import LLMMessage, LLMRequest, LLMResponse, LLMRuntime, LLMToolCall, LLMToolDefinition
 from kernel.tools import ToolRegistry, ToolRuntime
@@ -235,6 +235,18 @@ def test_final_response_with_no_tool_calls_completes() -> None:
     assert events.by_type("agent_tool_loop_started")[0].metadata["execution_mode"] == (
         "sequential"
     )
+    assert events.by_type("agent_tool_loop_started")[0].metadata[
+        "tool_policy_enabled"
+    ] is False
+    assert events.by_type("agent_tool_loop_started")[0].metadata[
+        "policy_default_allow"
+    ] is True
+    assert events.by_type("agent_tool_loop_started")[0].metadata[
+        "allowed_tool_count"
+    ] == 0
+    assert events.by_type("agent_tool_loop_started")[0].metadata[
+        "denied_tool_count"
+    ] == 0
     assert timeline_event_types(events) == [
         "agent_tool_loop_started",
         "llm_request_started",
@@ -602,6 +614,198 @@ def test_parallel_group_failure_collects_completed_tool_results() -> None:
     assert group_failure.metadata["failed_tool_count"] == 1
 
 
+def test_default_tool_permission_policy_preserves_tool_execution() -> None:
+    executions: list[tuple[str, float, float]] = []
+    events = RuntimeEventLog()
+    provider = ScriptedProvider(
+        [
+            tool_response(tool_call("call_add", arguments={"a": 15, "b": 27})),
+            final_response("42"),
+        ]
+    )
+    loop = build_loop(
+        provider,
+        arithmetic_registry(executions),
+        events,
+        AgentToolLoopConfig(tool_permission_policy=ToolPermissionPolicy()),
+    )
+
+    result = loop.run(
+        [{"role": "user", "content": "Use add_numbers."}],
+        tools=[add_tool_definition(), multiply_tool_definition()],
+    )
+
+    assert result.completed is True
+    assert executions == [("add_numbers", 15, 27)]
+    started = events.by_type("agent_tool_loop_started")[0]
+    assert started.metadata["tool_policy_enabled"] is True
+    assert started.metadata["policy_default_allow"] is True
+    assert started.metadata["allowed_tool_count"] == 0
+    assert started.metadata["denied_tool_count"] == 0
+
+
+def test_allowlist_tool_permission_policy_permits_listed_tool() -> None:
+    executions: list[tuple[str, float, float]] = []
+    provider = ScriptedProvider(
+        [
+            tool_response(tool_call("call_add", arguments={"a": 15, "b": 27})),
+            final_response("42"),
+        ]
+    )
+    loop = build_loop(
+        provider,
+        arithmetic_registry(executions),
+        config=AgentToolLoopConfig(
+            tool_permission_policy=ToolPermissionPolicy(
+                default_allow=False,
+                allowed_tools={"add_numbers"},
+            )
+        ),
+    )
+
+    result = loop.run(
+        [{"role": "user", "content": "Use add_numbers."}],
+        tools=[add_tool_definition(), multiply_tool_definition()],
+    )
+
+    assert result.completed is True
+    assert result.reason == "completed"
+    assert executions == [("add_numbers", 15, 27)]
+    assert result.tool_results[0].success is True
+
+
+def test_allowlist_tool_permission_policy_denies_unlisted_tool() -> None:
+    executions: list[tuple[str, float, float]] = []
+    events = RuntimeEventLog()
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                tool_call(
+                    "call_multiply",
+                    name="multiply_numbers",
+                    arguments={"a": 6, "b": 9},
+                )
+            )
+        ]
+    )
+    loop = build_loop(
+        provider,
+        arithmetic_registry(executions),
+        events,
+        AgentToolLoopConfig(
+            tool_permission_policy=ToolPermissionPolicy(
+                default_allow=False,
+                allowed_tools={"add_numbers"},
+            )
+        ),
+    )
+
+    result = loop.run(
+        [{"role": "user", "content": "Use multiply_numbers."}],
+        tools=[add_tool_definition(), multiply_tool_definition()],
+    )
+
+    assert result.completed is False
+    assert result.reason == "tool_error"
+    assert executions == []
+    assert result.tool_results[0].success is False
+    assert result.tool_results[0].name == "multiply_numbers"
+    assert "Tool call denied by permission policy: multiply_numbers" == (
+        result.tool_results[0].error
+    )
+    denied = events.by_type("tool_call_denied")[0]
+    assert denied.metadata["tool_call_id"] == "call_multiply"
+    assert denied.metadata["tool_name"] == "multiply_numbers"
+    assert denied.metadata["reason"] == "permission_policy"
+    assert denied.metadata["round_index"] == 0
+    assert denied.metadata["requested_execution_mode"] == "sequential"
+    assert denied.metadata["effective_execution_mode"] == "sequential"
+    assert denied.metadata["policy_default_allow"] is False
+    assert denied.metadata["matched_rule"] == "not_in_allowed_tools"
+    assert events.by_type("tool_execution_started") == []
+    group_failure = events.by_type("tool_execution_group_failed")[0]
+    assert group_failure.metadata["failed_tool_count"] == 1
+    assert group_failure.metadata["denied_tool_count"] == 1
+
+
+def test_denylist_tool_permission_policy_blocks_tool() -> None:
+    executions: list[tuple[str, float, float]] = []
+    events = RuntimeEventLog()
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                tool_call(
+                    "call_multiply",
+                    name="multiply_numbers",
+                    arguments={"a": 6, "b": 9},
+                )
+            )
+        ]
+    )
+    loop = build_loop(
+        provider,
+        arithmetic_registry(executions),
+        events,
+        AgentToolLoopConfig(
+            tool_permission_policy=ToolPermissionPolicy(
+                default_allow=True,
+                denied_tools={"multiply_numbers"},
+            )
+        ),
+    )
+
+    result = loop.run(
+        [{"role": "user", "content": "Use multiply_numbers."}],
+        tools=[add_tool_definition(), multiply_tool_definition()],
+    )
+
+    assert result.completed is False
+    assert executions == []
+    assert result.tool_results[0].error == (
+        "Tool call denied by permission policy: multiply_numbers"
+    )
+    denied = events.by_type("tool_call_denied")[0]
+    assert denied.metadata["matched_rule"] == "denied_tools"
+    assert denied.metadata["policy_default_allow"] is True
+
+
+def test_denylist_tool_permission_policy_wins_over_allowlist() -> None:
+    executions: list[tuple[str, float, float]] = []
+    events = RuntimeEventLog()
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                tool_call(
+                    "call_multiply",
+                    name="multiply_numbers",
+                    arguments={"a": 6, "b": 9},
+                )
+            )
+        ]
+    )
+    loop = build_loop(
+        provider,
+        arithmetic_registry(executions),
+        events,
+        AgentToolLoopConfig(
+            tool_permission_policy=ToolPermissionPolicy(
+                allowed_tools={"multiply_numbers"},
+                denied_tools={"multiply_numbers"},
+            )
+        ),
+    )
+
+    result = loop.run(
+        [{"role": "user", "content": "Use multiply_numbers."}],
+        tools=[add_tool_definition(), multiply_tool_definition()],
+    )
+
+    assert result.completed is False
+    assert executions == []
+    assert result.tool_results[0].success is False
+    assert events.by_type("tool_call_denied")[0].metadata["matched_rule"] == "denied_tools"
+
+
 def test_multi_round_parallel_group_waits_before_next_llm_round() -> None:
     events = RuntimeEventLog()
     registry = slow_parallel_arithmetic_registry()
@@ -863,6 +1067,107 @@ def test_multi_round_tool_failure_preserves_existing_failure_semantics() -> None
     assert group_failure.metadata["successful_tool_count"] == 0
     assert group_failure.metadata["failed_tool_count"] == 1
     assert events.by_type("agent_tool_loop_failed")[-1].metadata["reason"] == "tool_error"
+
+
+def test_multi_round_tool_permission_policy_enforces_each_round() -> None:
+    executions: list[tuple[str, float, float]] = []
+    events = RuntimeEventLog()
+    provider = ScriptedProvider(
+        [
+            tool_response(tool_call("call_add", arguments={"a": 20, "b": 22})),
+            tool_response(
+                tool_call(
+                    "call_multiply",
+                    name="multiply_numbers",
+                    arguments={"a": 42, "b": 2},
+                )
+            ),
+        ]
+    )
+    loop = build_loop(
+        provider,
+        arithmetic_registry(executions),
+        events,
+        AgentToolLoopConfig(
+            tool_permission_policy=ToolPermissionPolicy(
+                default_allow=False,
+                allowed_tools={"add_numbers"},
+            )
+        ),
+    )
+
+    result = loop.run(
+        [{"role": "user", "content": "Compute a multi-round answer."}],
+        tools=[add_tool_definition(), multiply_tool_definition()],
+        max_steps=4,
+    )
+
+    assert result.completed is False
+    assert result.reason == "tool_error"
+    assert executions == [("add_numbers", 20, 22)]
+    assert [tool_result.name for tool_result in result.tool_results] == [
+        "add_numbers",
+        "multiply_numbers",
+    ]
+    assert [tool_result.success for tool_result in result.tool_results] == [True, False]
+    denied = events.by_type("tool_call_denied")[0]
+    assert denied.metadata["round_index"] == 1
+    assert denied.metadata["tool_name"] == "multiply_numbers"
+    assert events.by_type("tool_execution_group_failed")[0].metadata["round_index"] == 1
+
+
+def test_parallel_tool_permission_policy_denies_without_scheduling_tool() -> None:
+    executions: list[tuple[str, float, float]] = []
+    events = RuntimeEventLog()
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                tool_call("call_add", arguments={"a": 20, "b": 22}),
+                tool_call(
+                    "call_multiply",
+                    name="multiply_numbers",
+                    arguments={"a": 6, "b": 7},
+                ),
+            )
+        ]
+    )
+    loop = build_loop(
+        provider,
+        arithmetic_registry(executions, parallel_safe=True),
+        events,
+        AgentToolLoopConfig(
+            tool_execution_mode="parallel",
+            tool_permission_policy=ToolPermissionPolicy(
+                default_allow=False,
+                allowed_tools={"add_numbers"},
+            ),
+        ),
+    )
+
+    result = loop.run(
+        [{"role": "user", "content": "Use both tools."}],
+        tools=[add_tool_definition(), multiply_tool_definition()],
+    )
+
+    assert result.completed is False
+    assert result.reason == "tool_error"
+    assert executions == [("add_numbers", 20, 22)]
+    assert [tool_result.name for tool_result in result.tool_results] == [
+        "add_numbers",
+        "multiply_numbers",
+    ]
+    assert [tool_result.success for tool_result in result.tool_results] == [True, False]
+    assert [
+        event.metadata["tool_name"] for event in events.by_type("tool_execution_started")
+    ] == ["add_numbers"]
+    denied = events.by_type("tool_call_denied")[0]
+    assert denied.metadata["tool_name"] == "multiply_numbers"
+    assert denied.metadata["requested_execution_mode"] == "parallel"
+    assert denied.metadata["effective_execution_mode"] == "parallel"
+    group_failure = events.by_type("tool_execution_group_failed")[0]
+    assert group_failure.metadata["successful_tool_count"] == 1
+    assert group_failure.metadata["failed_tool_count"] == 1
+    assert group_failure.metadata["denied_tool_count"] == 1
 
 
 def test_multi_round_llm_provider_failure_in_followup_round() -> None:

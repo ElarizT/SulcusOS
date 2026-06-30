@@ -140,6 +140,33 @@ def test_timeline_formats_tool_execution_group_mode_metadata() -> None:
     assert "tool_names" not in row
 
 
+def test_timeline_formats_tool_permission_metadata() -> None:
+    row = format_timeline_event(
+        event(
+            15,
+            "AgentToolLoop",
+            "tool_call_denied",
+            "Tool call denied",
+            {
+                "tool_name": "multiply_numbers",
+                "round_index": 1,
+                "reason": "permission_policy",
+                "policy_default_allow": False,
+                "matched_rule": "not_in_allowed_tools",
+                "tool_call_id": "call_secret",
+            },
+        )
+    )
+
+    assert "tool_call_denied" in row
+    assert "multiply_numbers" in row
+    assert "round_index=1" in row
+    assert "reason=permission_policy" in row
+    assert "policy_default_allow=False" in row
+    assert "matched_rule=not_in_allowed_tools" in row
+    assert "tool_call_id" not in row
+
+
 def test_timeline_safely_renders_legacy_strings_and_dictionaries() -> None:
     rows = render_runtime_timeline(
         [

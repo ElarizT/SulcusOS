@@ -5,6 +5,7 @@ from kernel.agent_tool_loop import (
     AgentToolLoopConfig,
     AgentToolLoopResult,
     AgentToolLoopStep,
+    ToolPermissionPolicy,
     ToolExecutionMode,
 )
 
@@ -13,5 +14,6 @@ __all__ = [
     "AgentToolLoopConfig",
     "AgentToolLoopResult",
     "AgentToolLoopStep",
+    "ToolPermissionPolicy",
     "ToolExecutionMode",
 ]
