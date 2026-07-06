@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
@@ -75,6 +75,42 @@ class ToolPermissionDecision:
 
 
 @dataclass(frozen=True)
+class ToolResourceLimits:
+    """Optional per-run safety limits for agent-loop tool usage.
+
+    Requested calls count toward call limits, including permission-denied and
+    resource-denied calls. Timeouts apply only after actual execution starts.
+    """
+
+    max_tool_calls_per_loop: int | None = None
+    max_tool_calls_per_round: int | None = None
+    max_calls_per_tool: Mapping[str, int] | None = None
+    tool_timeout_ms: int | None = None
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "max_tool_calls_per_loop",
+            "max_tool_calls_per_round",
+            "tool_timeout_ms",
+        ):
+            _validate_optional_nonnegative_int(getattr(self, field_name), field_name)
+        if self.max_calls_per_tool is None:
+            return
+        if not isinstance(self.max_calls_per_tool, Mapping):
+            raise ValueError("max_calls_per_tool must be a mapping of tool names to limits")
+        normalized: dict[str, int] = {}
+        for tool_name, limit in self.max_calls_per_tool.items():
+            if not isinstance(tool_name, str) or not tool_name.strip():
+                raise ValueError("max_calls_per_tool keys must be nonempty strings")
+            if tool_name.strip() != tool_name:
+                raise ValueError("max_calls_per_tool tool names must not contain whitespace")
+            _validate_optional_nonnegative_int(limit, "max_calls_per_tool values")
+            assert limit is not None
+            normalized[tool_name] = limit
+        object.__setattr__(self, "max_calls_per_tool", normalized)
+
+
+@dataclass(frozen=True)
 class AgentToolLoopConfig:
     """Conservative controls for bounded LLM-tool orchestration.
 
@@ -89,6 +125,7 @@ class AgentToolLoopConfig:
     tool_execution_mode: ToolExecutionMode = "sequential"
     include_intermediate_steps: bool = True
     tool_permission_policy: ToolPermissionPolicy | None = None
+    tool_resource_limits: ToolResourceLimits | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -111,6 +148,11 @@ class AgentToolLoopConfig:
             ToolPermissionPolicy,
         ):
             raise ValueError("tool_permission_policy must be a ToolPermissionPolicy")
+        if self.tool_resource_limits is not None and not isinstance(
+            self.tool_resource_limits,
+            ToolResourceLimits,
+        ):
+            raise ValueError("tool_resource_limits must be a ToolResourceLimits")
 
 
 @dataclass(frozen=True)
@@ -171,6 +213,10 @@ class _ToolOutcome:
     error_type: str | None = None
     error_category: str | None = None
     denied: bool = False
+    resource_denied: bool = False
+    timed_out: bool = False
+    limit_name: str | None = None
+    limit_value: int | None = None
 
 
 @dataclass(frozen=True)
@@ -179,6 +225,70 @@ class _ResolvedToolExecutionMode:
     fallback_reason: str | None
     parallel_safe_tool_count: int
     unsafe_tool_count: int
+
+
+@dataclass(frozen=True)
+class _ToolResourceDecision:
+    allowed: bool
+    limit_name: str | None = None
+    limit_value: int | None = None
+    current_count: int | None = None
+
+
+class _ToolResourceLimitState:
+    """Mutable per-run requested-call counters for tool resource limits."""
+
+    def __init__(self, limits: ToolResourceLimits | None) -> None:
+        self.limits = limits
+        self.total_requested = 0
+        self.round_requested: dict[int, int] = {}
+        self.tool_requested: dict[str, int] = {}
+
+    def record_requested(
+        self,
+        tool_call: LLMToolCall,
+        *,
+        round_index: int,
+    ) -> _ToolResourceDecision:
+        self.total_requested += 1
+        round_count = self.round_requested.get(round_index, 0) + 1
+        self.round_requested[round_index] = round_count
+        tool_count = self.tool_requested.get(tool_call.name, 0) + 1
+        self.tool_requested[tool_call.name] = tool_count
+
+        limits = self.limits
+        if limits is None:
+            return _ToolResourceDecision(True)
+        if (
+            limits.max_tool_calls_per_loop is not None
+            and self.total_requested > limits.max_tool_calls_per_loop
+        ):
+            return _ToolResourceDecision(
+                False,
+                "max_tool_calls_per_loop",
+                limits.max_tool_calls_per_loop,
+                self.total_requested,
+            )
+        if (
+            limits.max_tool_calls_per_round is not None
+            and round_count > limits.max_tool_calls_per_round
+        ):
+            return _ToolResourceDecision(
+                False,
+                "max_tool_calls_per_round",
+                limits.max_tool_calls_per_round,
+                round_count,
+            )
+        per_tool_limits = limits.max_calls_per_tool or {}
+        per_tool_limit = per_tool_limits.get(tool_call.name)
+        if per_tool_limit is not None and tool_count > per_tool_limit:
+            return _ToolResourceDecision(
+                False,
+                "max_calls_per_tool",
+                per_tool_limit,
+                tool_count,
+            )
+        return _ToolResourceDecision(True)
 
 
 class AgentToolLoop:
@@ -223,6 +333,7 @@ class AgentToolLoop:
         tool_execution_mode: ToolExecutionMode | str | None = None,
         include_intermediate_steps: bool | None = None,
         tool_permission_policy: ToolPermissionPolicy | None = None,
+        tool_resource_limits: ToolResourceLimits | None = None,
     ) -> AgentToolLoopResult:
         """Run a bounded explicit LLM -> tool -> LLM loop."""
         config = _resolve_config(
@@ -234,6 +345,7 @@ class AgentToolLoop:
             tool_execution_mode=tool_execution_mode,
             include_intermediate_steps=include_intermediate_steps,
             tool_permission_policy=tool_permission_policy,
+            tool_resource_limits=tool_resource_limits,
         )
         if config.allow_parallel_tool_calls:
             raise ValueError("parallel tool calls are not supported yet")
@@ -243,6 +355,8 @@ class AgentToolLoop:
         allowed_tool_names = frozenset(tool.name for tool in tool_definitions)
         permission_policy = config.tool_permission_policy or ToolPermissionPolicy()
         policy_summary = _tool_permission_policy_summary(config.tool_permission_policy)
+        resource_limit_state = _ToolResourceLimitState(config.tool_resource_limits)
+        resource_limit_summary = _tool_resource_limits_summary(config.tool_resource_limits)
         route_metadata = _runtime_route_metadata(self.llm_runtime, provider, model)
         steps: list[AgentToolLoopStep] = []
         all_tool_results: list[LLMToolResult] = []
@@ -259,6 +373,7 @@ class AgentToolLoop:
                 "tool_count": len(tool_definitions),
                 "tool_names": tuple(tool.name for tool in tool_definitions),
                 **policy_summary,
+                **resource_limit_summary,
                 **route_metadata,
                 **_agent_metadata(metadata),
             },
@@ -585,6 +700,9 @@ class AgentToolLoop:
                 successful_tool_count=0,
                 failed_tool_count=0,
                 denied_tool_count=denied_tool_count,
+                resource_denied_tool_count=0,
+                timed_out_tool_count=0,
+                tool_resource_limits=config.tool_resource_limits,
             )
             self._emit(
                 "tool_execution_group_started",
@@ -599,6 +717,8 @@ class AgentToolLoop:
                 max_steps=config.max_steps,
                 requested_execution_mode=config.tool_execution_mode,
                 effective_execution_mode=resolved_mode.effective_execution_mode,
+                resource_limit_state=resource_limit_state,
+                tool_resource_limits=config.tool_resource_limits,
                 provider=response.provider,
                 model=response.model,
                 stop_on_tool_error=config.stop_on_tool_error,
@@ -619,6 +739,10 @@ class AgentToolLoop:
             successful_tool_count = sum(1 for outcome in outcomes if outcome.success)
             failed_tool_count = len(outcomes) - successful_tool_count
             denied_tool_count = sum(1 for outcome in outcomes if outcome.denied)
+            resource_denied_tool_count = sum(
+                1 for outcome in outcomes if outcome.resource_denied
+            )
+            timed_out_tool_count = sum(1 for outcome in outcomes if outcome.timed_out)
             completed_group_metadata = _tool_execution_group_metadata(
                 requested_execution_mode=config.tool_execution_mode,
                 effective_execution_mode=resolved_mode.effective_execution_mode,
@@ -632,6 +756,9 @@ class AgentToolLoop:
                 successful_tool_count=successful_tool_count,
                 failed_tool_count=failed_tool_count,
                 denied_tool_count=denied_tool_count,
+                resource_denied_tool_count=resource_denied_tool_count,
+                timed_out_tool_count=timed_out_tool_count,
+                tool_resource_limits=config.tool_resource_limits,
             )
             if failed_outcome is None:
                 self._emit(
@@ -730,6 +857,8 @@ class AgentToolLoop:
         max_steps: int,
         requested_execution_mode: ToolExecutionMode,
         effective_execution_mode: ToolExecutionMode,
+        resource_limit_state: _ToolResourceLimitState,
+        tool_resource_limits: ToolResourceLimits | None,
         provider: str,
         model: str,
         stop_on_tool_error: bool,
@@ -743,6 +872,8 @@ class AgentToolLoop:
                 max_steps=max_steps,
                 requested_execution_mode=requested_execution_mode,
                 effective_execution_mode=effective_execution_mode,
+                resource_limit_state=resource_limit_state,
+                tool_resource_limits=tool_resource_limits,
                 provider=provider,
                 model=model,
             )
@@ -765,17 +896,34 @@ class AgentToolLoop:
                     "model": model,
                 },
             )
+            resource_decision = resource_limit_state.record_requested(
+                tool_call,
+                round_index=step_index,
+            )
             if permission_decision.allowed:
-                outcome = self._execute_tool_call(
-                    tool_call,
-                    allowed_tool_names=allowed_tool_names,
-                    step_index=step_index,
-                    max_steps=max_steps,
-                    requested_execution_mode=requested_execution_mode,
-                    effective_execution_mode=effective_execution_mode,
-                    provider=provider,
-                    model=model,
-                )
+                if resource_decision.allowed:
+                    outcome = self._execute_tool_call(
+                        tool_call,
+                        allowed_tool_names=allowed_tool_names,
+                        step_index=step_index,
+                        max_steps=max_steps,
+                        requested_execution_mode=requested_execution_mode,
+                        effective_execution_mode=effective_execution_mode,
+                        tool_resource_limits=tool_resource_limits,
+                        provider=provider,
+                        model=model,
+                    )
+                else:
+                    outcome = self._resource_deny_tool_call(
+                        tool_call,
+                        resource_decision,
+                        step_index=step_index,
+                        max_steps=max_steps,
+                        requested_execution_mode=requested_execution_mode,
+                        effective_execution_mode=effective_execution_mode,
+                        provider=provider,
+                        model=model,
+                    )
             else:
                 outcome = self._deny_tool_call(
                     tool_call,
@@ -802,11 +950,16 @@ class AgentToolLoop:
         max_steps: int,
         requested_execution_mode: ToolExecutionMode,
         effective_execution_mode: ToolExecutionMode,
+        resource_limit_state: _ToolResourceLimitState,
+        tool_resource_limits: ToolResourceLimits | None,
         provider: str,
         model: str,
     ) -> list[_ToolOutcome | None]:
         outcomes: list[_ToolOutcome | None] = [None] * len(tool_calls)
-        for tool_call in tool_calls:
+        permitted_calls: list[tuple[int, LLMToolCall]] = []
+        for index, (tool_call, permission_decision) in enumerate(
+            zip(tool_calls, permission_decisions)
+        ):
             self._emit(
                 "tool_call_requested",
                 "Agent tool loop tool call requested",
@@ -823,13 +976,24 @@ class AgentToolLoop:
                     "model": model,
                 },
             )
-
-        permitted_calls: list[tuple[int, LLMToolCall]] = []
-        for index, (tool_call, permission_decision) in enumerate(
-            zip(tool_calls, permission_decisions)
-        ):
+            resource_decision = resource_limit_state.record_requested(
+                tool_call,
+                round_index=step_index,
+            )
             if permission_decision.allowed:
-                permitted_calls.append((index, tool_call))
+                if resource_decision.allowed:
+                    permitted_calls.append((index, tool_call))
+                else:
+                    outcomes[index] = self._resource_deny_tool_call(
+                        tool_call,
+                        resource_decision,
+                        step_index=step_index,
+                        max_steps=max_steps,
+                        requested_execution_mode=requested_execution_mode,
+                        effective_execution_mode=effective_execution_mode,
+                        provider=provider,
+                        model=model,
+                    )
             else:
                 outcomes[index] = self._deny_tool_call(
                     tool_call,
@@ -857,6 +1021,7 @@ class AgentToolLoop:
                         max_steps=max_steps,
                         requested_execution_mode=requested_execution_mode,
                         effective_execution_mode=effective_execution_mode,
+                        tool_resource_limits=tool_resource_limits,
                         provider=provider,
                         model=model,
                     ),
@@ -926,6 +1091,49 @@ class AgentToolLoop:
         )
         return outcome
 
+    def _resource_deny_tool_call(
+        self,
+        tool_call: LLMToolCall,
+        resource_decision: _ToolResourceDecision,
+        *,
+        step_index: int,
+        max_steps: int,
+        requested_execution_mode: ToolExecutionMode,
+        effective_execution_mode: ToolExecutionMode,
+        provider: str,
+        model: str,
+    ) -> _ToolOutcome:
+        limit_name = resource_decision.limit_name or "resource_limits"
+        outcome = _resource_denied_tool_outcome(
+            tool_call,
+            limit_name=limit_name,
+        )
+        self._emit(
+            "tool_call_resource_denied",
+            "Agent tool loop tool call denied by resource limits",
+            {
+                "round_index": step_index,
+                "step_index": step_index,
+                "max_steps": max_steps,
+                "tool_call_id": tool_call.id,
+                "tool_name": tool_call.name,
+                "reason": "resource_limits",
+                "limit_name": limit_name,
+                "limit_value": resource_decision.limit_value,
+                "current_count": resource_decision.current_count,
+                "requested_execution_mode": requested_execution_mode,
+                "effective_execution_mode": effective_execution_mode,
+                "execution_mode": effective_execution_mode,
+                "success": False,
+                "provider": provider,
+                "model": model,
+                **_tool_result_preview_metadata(outcome.llm_result),
+                **_safe_error_metadata(outcome.error_type, outcome.error_category),
+            },
+            error=True,
+        )
+        return outcome
+
     def _emit_tool_outcome(
         self,
         tool_call: LLMToolCall,
@@ -958,6 +1166,10 @@ class AgentToolLoop:
             **_tool_result_preview_metadata(outcome.llm_result),
             **_safe_error_metadata(outcome.error_type, outcome.error_category),
         }
+        if outcome.limit_name is not None:
+            metadata["limit_name"] = outcome.limit_name
+        if outcome.limit_value is not None:
+            metadata["limit_value"] = outcome.limit_value
         self._emit(
             "tool_execution_completed" if outcome.success else "tool_execution_failed",
             (
@@ -986,6 +1198,7 @@ class AgentToolLoop:
                 "provider": provider,
                 "model": model,
                 **_safe_error_metadata(outcome.error_type, outcome.error_category),
+                **_limit_metadata(outcome),
             },
             error=not outcome.success,
         )
@@ -999,6 +1212,7 @@ class AgentToolLoop:
         max_steps: int,
         requested_execution_mode: ToolExecutionMode,
         effective_execution_mode: ToolExecutionMode,
+        tool_resource_limits: ToolResourceLimits | None,
         provider: str,
         model: str,
     ) -> _ToolOutcome:
@@ -1045,7 +1259,10 @@ class AgentToolLoop:
             )
         else:
             try:
-                execution_result = self.tool_runtime.execute(tool_call)
+                execution_result = self._execute_with_optional_timeout(
+                    tool_call,
+                    tool_resource_limits=tool_resource_limits,
+                )
             except Exception as exc:
                 outcome = _failed_tool_outcome(
                     tool_call,
@@ -1054,6 +1271,17 @@ class AgentToolLoop:
                 )
             else:
                 outcome = _outcome_from_execution_result(execution_result)
+                if (
+                    execution_result.error_type == "ToolTimeoutError"
+                    and tool_resource_limits is not None
+                    and tool_resource_limits.tool_timeout_ms is not None
+                ):
+                    outcome = replace(
+                        outcome,
+                        timed_out=True,
+                        limit_name="tool_timeout_ms",
+                        limit_value=tool_resource_limits.tool_timeout_ms,
+                    )
 
         self._emit_tool_outcome(
             tool_call,
@@ -1066,6 +1294,36 @@ class AgentToolLoop:
             model=model,
         )
         return outcome
+
+    def _execute_with_optional_timeout(
+        self,
+        tool_call: LLMToolCall,
+        *,
+        tool_resource_limits: ToolResourceLimits | None,
+    ) -> ToolExecutionResult:
+        timeout_ms = (
+            None if tool_resource_limits is None else tool_resource_limits.tool_timeout_ms
+        )
+        if timeout_ms is None:
+            return self.tool_runtime.execute(tool_call)
+
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(self.tool_runtime.execute, tool_call)
+        try:
+            return future.result(timeout=timeout_ms / 1000)
+        except FutureTimeoutError:
+            future.cancel()
+            return ToolExecutionResult(
+                name=tool_call.name,
+                success=False,
+                tool_call_id=tool_call.id,
+                error=f"Tool execution timed out after {timeout_ms}ms",
+                error_type="ToolTimeoutError",
+                error_category="timeout",
+                duration_ms=timeout_ms,
+            )
+        finally:
+            executor.shutdown(wait=future.done(), cancel_futures=True)
 
     def _coerce_tool_definitions(
         self,
@@ -1228,6 +1486,7 @@ def _resolve_config(
     tool_execution_mode: ToolExecutionMode | str | None,
     include_intermediate_steps: bool | None,
     tool_permission_policy: ToolPermissionPolicy | None,
+    tool_resource_limits: ToolResourceLimits | None,
 ) -> AgentToolLoopConfig:
     replacements: dict[str, Any] = {}
     if max_steps is not None:
@@ -1244,7 +1503,18 @@ def _resolve_config(
         replacements["include_intermediate_steps"] = include_intermediate_steps
     if tool_permission_policy is not None:
         replacements["tool_permission_policy"] = tool_permission_policy
+    if tool_resource_limits is not None:
+        replacements["tool_resource_limits"] = tool_resource_limits
     return replace(config, **replacements) if replacements else config
+
+
+def _validate_optional_nonnegative_int(value: Any, field_name: str) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field_name} must be a nonnegative integer or None")
+    if value < 0:
+        raise ValueError(f"{field_name} must be a nonnegative integer or None")
 
 
 def _validate_tool_execution_mode(mode: str) -> None:
@@ -1350,6 +1620,34 @@ def _permission_denied_tool_outcome(tool_call: LLMToolCall) -> _ToolOutcome:
     )
 
 
+def _resource_denied_tool_outcome(
+    tool_call: LLMToolCall,
+    *,
+    limit_name: str,
+) -> _ToolOutcome:
+    error = f"Tool call denied by resource limits: {limit_name} exceeded"
+    if limit_name == "max_calls_per_tool":
+        error = (
+            "Tool call denied by resource limits: "
+            f"max_calls_per_tool exceeded for {tool_call.name}"
+        )
+    return _ToolOutcome(
+        llm_result=LLMToolResult(
+            tool_call_id=tool_call.id,
+            name=tool_call.name,
+            content="",
+            success=False,
+            error=error,
+        ),
+        success=False,
+        error_type="ToolResourceLimitExceededError",
+        error_category="resource_limits",
+        denied=True,
+        resource_denied=True,
+        limit_name=limit_name,
+    )
+
+
 def _tool_names(tool_calls: Sequence[LLMToolCall]) -> tuple[str, ...]:
     return tuple(tool_call.name for tool_call in tool_calls)
 
@@ -1403,6 +1701,9 @@ def _tool_execution_group_metadata(
     successful_tool_count: int,
     failed_tool_count: int,
     denied_tool_count: int = 0,
+    resource_denied_tool_count: int = 0,
+    timed_out_tool_count: int = 0,
+    tool_resource_limits: ToolResourceLimits | None = None,
 ) -> dict[str, Any]:
     metadata: dict[str, Any] = {
         "execution_mode": effective_execution_mode,
@@ -1417,8 +1718,11 @@ def _tool_execution_group_metadata(
         "successful_tool_count": successful_tool_count,
         "failed_tool_count": failed_tool_count,
         "denied_tool_count": denied_tool_count,
+        "resource_denied_tool_count": resource_denied_tool_count,
+        "timed_out_tool_count": timed_out_tool_count,
         "provider": provider,
         "model": model,
+        **_tool_execution_group_resource_limit_metadata(tool_resource_limits),
     }
     if fallback_reason is not None:
         metadata["fallback_reason"] = fallback_reason
@@ -1447,6 +1751,50 @@ def _tool_permission_policy_summary(
         "allowed_tool_count": len(effective_policy.allowed_tools),
         "denied_tool_count": len(effective_policy.denied_tools),
     }
+
+
+def _tool_resource_limits_summary(
+    limits: ToolResourceLimits | None,
+) -> dict[str, int | bool | None]:
+    return {
+        "tool_resource_limits_enabled": limits is not None,
+        "max_tool_calls_per_loop": (
+            None if limits is None else limits.max_tool_calls_per_loop
+        ),
+        "max_tool_calls_per_round": (
+            None if limits is None else limits.max_tool_calls_per_round
+        ),
+        "max_calls_per_tool_count": (
+            0
+            if limits is None or limits.max_calls_per_tool is None
+            else len(limits.max_calls_per_tool)
+        ),
+        "tool_timeout_ms": None if limits is None else limits.tool_timeout_ms,
+    }
+
+
+def _tool_execution_group_resource_limit_metadata(
+    limits: ToolResourceLimits | None,
+) -> dict[str, int | bool | None]:
+    return {
+        "resource_limits_enabled": limits is not None,
+        "max_tool_calls_per_loop": (
+            None if limits is None else limits.max_tool_calls_per_loop
+        ),
+        "max_tool_calls_per_round": (
+            None if limits is None else limits.max_tool_calls_per_round
+        ),
+        "tool_timeout_ms": None if limits is None else limits.tool_timeout_ms,
+    }
+
+
+def _limit_metadata(outcome: _ToolOutcome) -> dict[str, int | str]:
+    metadata: dict[str, int | str] = {}
+    if outcome.limit_name is not None:
+        metadata["limit_name"] = outcome.limit_name
+    if outcome.limit_value is not None:
+        metadata["limit_value"] = outcome.limit_value
+    return metadata
 
 
 def _runtime_route_metadata(

@@ -167,6 +167,37 @@ def test_timeline_formats_tool_permission_metadata() -> None:
     assert "tool_call_id" not in row
 
 
+def test_timeline_formats_tool_resource_limit_metadata() -> None:
+    row = format_timeline_event(
+        event(
+            15,
+            "AgentToolLoop",
+            "tool_call_resource_denied",
+            "Tool call resource denied",
+            {
+                "tool_name": "search_docs",
+                "round_index": 2,
+                "reason": "resource_limits",
+                "limit_name": "max_calls_per_tool",
+                "limit_value": 3,
+                "current_count": 4,
+                "resource_denied_tool_count": 1,
+                "tool_call_id": "call_secret",
+            },
+        )
+    )
+
+    assert "tool_call_resource_denied" in row
+    assert "search_docs" in row
+    assert "round_index=2" in row
+    assert "reason=resource_limits" in row
+    assert "limit_name=max_calls_per_tool" in row
+    assert "limit_value=3" in row
+    assert "current_count=4" in row
+    assert "resource_denied_tool_count=1" in row
+    assert "tool_call_id" not in row
+
+
 def test_timeline_safely_renders_legacy_strings_and_dictionaries() -> None:
     rows = render_runtime_timeline(
         [

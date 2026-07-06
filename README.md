@@ -689,3 +689,63 @@ Run the offline deterministic permission demo:
 ```powershell
 python examples/agent_tool_loop_tool_permission_demo.py
 ```
+
+### Tool Resource Limits
+
+Tool usage is unlimited by default for backwards compatibility. Configure
+`ToolResourceLimits` when an agent loop needs explicit runtime safety controls:
+
+```python
+from kernel.agent_tool_loop import AgentToolLoopConfig, ToolResourceLimits
+
+config = AgentToolLoopConfig(
+    tool_resource_limits=ToolResourceLimits(max_tool_calls_per_loop=4)
+)
+
+per_round = ToolResourceLimits(max_tool_calls_per_round=2)
+per_tool = ToolResourceLimits(max_calls_per_tool={"search_docs": 3})
+timeout = ToolResourceLimits(tool_timeout_ms=500)
+```
+
+Supported limits:
+
+- `max_tool_calls_per_loop`: caps requested tool calls across the whole run.
+- `max_tool_calls_per_round`: caps requested tool calls in one LLM response.
+- `max_calls_per_tool`: caps requested calls by tool name across the run.
+- `tool_timeout_ms`: caps actual tool execution duration per call.
+
+`None` means unlimited. Zero is valid and means no calls are allowed for that
+limit. Call-count limits count requested tool calls, including
+permission-denied and resource-denied calls, because the agent attempted to use
+runtime tool capacity. Limits apply across multi-round loops.
+
+Resource-denied calls return normal failed `LLMToolResult` values with errors
+such as `Tool call denied by resource limits: max_tool_calls_per_loop exceeded`.
+They do not execute the tool and do not emit `tool_execution_started`. Sulcus OS
+emits `tool_call_requested` first, then `tool_call_resource_denied`.
+
+Timeouts happen after execution starts. A timed-out tool emits
+`tool_execution_started` followed by `tool_execution_failed` with
+`error_type="ToolTimeoutError"`, `error_category="timeout"`, and
+`limit_name="tool_timeout_ms"`. Synchronous Python tool functions run through a
+thread when an agent-loop timeout is configured; Python cannot forcibly kill a
+stuck thread, so the loop returns a timeout result while the underlying function
+may finish later.
+
+Permissions and resource limits work together. Permission denial wins over
+resource denial for a single call, so forbidden tools emit `tool_call_denied`
+rather than `tool_call_resource_denied`. In parallel mode, permission-denied and
+resource-denied calls are not submitted to the executor, while result ordering
+still follows the original LLM tool-call order.
+
+Loop start metadata includes a safe resource-limit summary:
+`tool_resource_limits_enabled`, `max_tool_calls_per_loop`,
+`max_tool_calls_per_round`, `max_calls_per_tool_count`, and `tool_timeout_ms`.
+Group metadata includes `resource_limits_enabled`,
+`resource_denied_tool_count`, and `timed_out_tool_count`.
+
+Run the offline deterministic resource-limit demo:
+
+```powershell
+python examples/agent_tool_loop_resource_limits_demo.py
+```
