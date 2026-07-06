@@ -3,7 +3,12 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from kernel.agent_tool_loop import AgentToolLoop, AgentToolLoopConfig, ToolPermissionPolicy
+from kernel.agent_tool_loop import (
+    AgentToolLoop,
+    AgentToolLoopConfig,
+    ToolPermissionPolicy,
+    ToolResourceLimits,
+)
 from kernel.events import RuntimeEventLog
 from kernel.llm import LLMMessage, LLMRequest, LLMResponse, LLMRuntime, LLMToolCall, LLMToolDefinition
 from kernel.tools import ToolRegistry, ToolRuntime
@@ -1168,6 +1173,399 @@ def test_parallel_tool_permission_policy_denies_without_scheduling_tool() -> Non
     assert group_failure.metadata["successful_tool_count"] == 1
     assert group_failure.metadata["failed_tool_count"] == 1
     assert group_failure.metadata["denied_tool_count"] == 1
+
+
+def test_tool_resource_limits_validate_nonnegative_values() -> None:
+    ToolResourceLimits(max_tool_calls_per_loop=0)
+
+    for kwargs in (
+        {"max_tool_calls_per_loop": -1},
+        {"max_tool_calls_per_round": -1},
+        {"tool_timeout_ms": -1},
+        {"max_calls_per_tool": {"add_numbers": -1}},
+    ):
+        try:
+            ToolResourceLimits(**kwargs)  # type: ignore[arg-type]
+        except ValueError as exc:
+            assert "nonnegative integer" in str(exc)
+        else:
+            raise AssertionError(f"invalid limits should fail: {kwargs}")
+
+
+def test_max_tool_calls_per_loop_allows_within_limit_across_rounds() -> None:
+    events = RuntimeEventLog()
+    executions: list[tuple[str, float, float]] = []
+    registry = arithmetic_registry(executions)
+    provider = ScriptedProvider(
+        [
+            tool_response(tool_call("call_add")),
+            tool_response(
+                tool_call(
+                    "call_multiply",
+                    name="multiply_numbers",
+                    arguments={"a": 6, "b": 7},
+                )
+            ),
+            final_response("done"),
+        ]
+    )
+    loop = build_loop(
+        provider,
+        registry,
+        events,
+        AgentToolLoopConfig(
+            tool_resource_limits=ToolResourceLimits(max_tool_calls_per_loop=2)
+        ),
+    )
+
+    result = loop.run([{"role": "user", "content": "Use two tools."}])
+
+    assert result.completed is True
+    assert [tool_result.success for tool_result in result.tool_results] == [True, True]
+    assert [execution[0] for execution in executions] == [
+        "add_numbers",
+        "multiply_numbers",
+    ]
+    assert events.by_type("tool_call_resource_denied") == []
+
+
+def test_max_tool_calls_per_loop_denies_when_exceeded() -> None:
+    events = RuntimeEventLog()
+    executions: list[tuple[str, float, float]] = []
+    registry = arithmetic_registry(executions)
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                tool_call("call_add"),
+                tool_call(
+                    "call_multiply",
+                    name="multiply_numbers",
+                    arguments={"a": 6, "b": 7},
+                ),
+            ),
+            final_response("not reached"),
+        ]
+    )
+    loop = build_loop(
+        provider,
+        registry,
+        events,
+        AgentToolLoopConfig(
+            tool_resource_limits=ToolResourceLimits(max_tool_calls_per_loop=1)
+        ),
+    )
+
+    result = loop.run([{"role": "user", "content": "Use two tools."}])
+
+    assert result.completed is False
+    assert [tool_result.success for tool_result in result.tool_results] == [True, False]
+    assert result.tool_results[1].error == (
+        "Tool call denied by resource limits: max_tool_calls_per_loop exceeded"
+    )
+    assert [execution[0] for execution in executions] == ["add_numbers"]
+    denied = events.by_type("tool_call_resource_denied")[0]
+    assert denied.metadata["limit_name"] == "max_tool_calls_per_loop"
+    assert denied.metadata["limit_value"] == 1
+    assert denied.metadata["current_count"] == 2
+    assert [
+        event.metadata["tool_name"]
+        for event in events.by_type("tool_execution_started")
+    ] == ["add_numbers"]
+    group_failure = events.by_type("tool_execution_group_failed")[0]
+    assert group_failure.metadata["resource_denied_tool_count"] == 1
+
+
+def test_max_tool_calls_per_round_denies_second_call_in_oversized_group() -> None:
+    events = RuntimeEventLog()
+    executions: list[tuple[str, float, float]] = []
+    registry = arithmetic_registry(executions)
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                tool_call("call_add"),
+                tool_call(
+                    "call_multiply",
+                    name="multiply_numbers",
+                    arguments={"a": 6, "b": 7},
+                ),
+            ),
+            final_response("not reached"),
+        ]
+    )
+    loop = build_loop(
+        provider,
+        registry,
+        events,
+        AgentToolLoopConfig(
+            tool_resource_limits=ToolResourceLimits(max_tool_calls_per_round=1)
+        ),
+    )
+
+    result = loop.run([{"role": "user", "content": "Use two tools."}])
+
+    assert [tool_result.success for tool_result in result.tool_results] == [True, False]
+    assert result.tool_results[1].error == (
+        "Tool call denied by resource limits: max_tool_calls_per_round exceeded"
+    )
+    assert [execution[0] for execution in executions] == ["add_numbers"]
+    assert events.by_type("tool_call_resource_denied")[0].metadata["limit_name"] == (
+        "max_tool_calls_per_round"
+    )
+
+
+def test_max_calls_per_tool_denies_repeated_tool_across_rounds() -> None:
+    events = RuntimeEventLog()
+    executions: list[tuple[float, float]] = []
+    registry = add_registry(executions)
+    provider = ScriptedProvider(
+        [
+            tool_response(tool_call("call_add_1")),
+            tool_response(tool_call("call_add_2")),
+            final_response("not reached"),
+        ]
+    )
+    loop = build_loop(
+        provider,
+        registry,
+        events,
+        AgentToolLoopConfig(
+            tool_resource_limits=ToolResourceLimits(
+                max_calls_per_tool={"add_numbers": 1}
+            )
+        ),
+    )
+
+    result = loop.run([{"role": "user", "content": "Use add twice."}])
+
+    assert result.completed is False
+    assert [tool_result.success for tool_result in result.tool_results] == [True, False]
+    assert result.tool_results[1].error == (
+        "Tool call denied by resource limits: max_calls_per_tool exceeded for add_numbers"
+    )
+    assert executions == [(15, 27)]
+    denied = events.by_type("tool_call_resource_denied")[0]
+    assert denied.metadata["round_index"] == 1
+    assert denied.metadata["limit_name"] == "max_calls_per_tool"
+
+
+def test_zero_tool_call_limit_denies_all_tool_calls() -> None:
+    events = RuntimeEventLog()
+    executions: list[tuple[float, float]] = []
+    registry = add_registry(executions)
+    provider = ScriptedProvider([tool_response(tool_call("call_add"))])
+    loop = build_loop(
+        provider,
+        registry,
+        events,
+        AgentToolLoopConfig(
+            tool_resource_limits=ToolResourceLimits(max_tool_calls_per_loop=0)
+        ),
+    )
+
+    result = loop.run([{"role": "user", "content": "Add numbers."}])
+
+    assert result.completed is False
+    assert result.tool_results[0].success is False
+    assert executions == []
+    assert events.by_type("tool_execution_started") == []
+    assert events.by_type("tool_call_resource_denied")[0].metadata["current_count"] == 1
+
+
+def test_tool_resource_limits_can_be_passed_as_run_override() -> None:
+    events = RuntimeEventLog()
+    executions: list[tuple[float, float]] = []
+    registry = add_registry(executions)
+    provider = ScriptedProvider([tool_response(tool_call("call_add"))])
+    loop = build_loop(provider, registry, events)
+
+    result = loop.run(
+        [{"role": "user", "content": "Add numbers."}],
+        tool_resource_limits=ToolResourceLimits(max_tool_calls_per_loop=0),
+    )
+
+    assert result.tool_results[0].success is False
+    assert executions == []
+    assert events.by_type("tool_call_resource_denied")[0].metadata["limit_name"] == (
+        "max_tool_calls_per_loop"
+    )
+
+
+def test_permission_denial_wins_over_resource_denial() -> None:
+    events = RuntimeEventLog()
+    executions: list[tuple[float, float]] = []
+    registry = add_registry(executions)
+    provider = ScriptedProvider([tool_response(tool_call("call_add"))])
+    loop = build_loop(
+        provider,
+        registry,
+        events,
+        AgentToolLoopConfig(
+            tool_permission_policy=ToolPermissionPolicy(
+                default_allow=False,
+                allowed_tools=frozenset(),
+            ),
+            tool_resource_limits=ToolResourceLimits(max_tool_calls_per_loop=0),
+        ),
+    )
+
+    result = loop.run([{"role": "user", "content": "Add numbers."}])
+
+    assert result.tool_results[0].error == (
+        "Tool call denied by permission policy: add_numbers"
+    )
+    assert events.by_type("tool_call_denied")
+    assert events.by_type("tool_call_resource_denied") == []
+    assert executions == []
+
+
+def test_parallel_resource_denial_preserves_result_order_without_scheduling_denied_tool() -> None:
+    events = RuntimeEventLog()
+    executions: list[tuple[str, float, float]] = []
+    registry = arithmetic_registry(executions, parallel_safe=True)
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                tool_call("call_add"),
+                tool_call(
+                    "call_multiply",
+                    name="multiply_numbers",
+                    arguments={"a": 6, "b": 7},
+                ),
+            ),
+            final_response("not reached"),
+        ]
+    )
+    loop = build_loop(
+        provider,
+        registry,
+        events,
+        AgentToolLoopConfig(
+            tool_execution_mode="parallel",
+            tool_resource_limits=ToolResourceLimits(max_tool_calls_per_round=1),
+        ),
+    )
+
+    result = loop.run([{"role": "user", "content": "Use two tools."}])
+
+    assert [tool_result.name for tool_result in result.tool_results] == [
+        "add_numbers",
+        "multiply_numbers",
+    ]
+    assert [tool_result.success for tool_result in result.tool_results] == [True, False]
+    assert [execution[0] for execution in executions] == ["add_numbers"]
+    assert events.by_type("tool_call_resource_denied")[0].metadata["tool_name"] == (
+        "multiply_numbers"
+    )
+
+
+def test_tool_timeout_high_enough_allows_fast_tool() -> None:
+    events = RuntimeEventLog()
+    executions: list[tuple[float, float]] = []
+    registry = add_registry(executions)
+    provider = ScriptedProvider([tool_response(tool_call("call_add")), final_response()])
+    loop = build_loop(
+        provider,
+        registry,
+        events,
+        AgentToolLoopConfig(
+            tool_resource_limits=ToolResourceLimits(tool_timeout_ms=500)
+        ),
+    )
+
+    result = loop.run([{"role": "user", "content": "Add numbers."}])
+
+    assert result.completed is True
+    assert result.tool_results[0].success is True
+    assert events.by_type("tool_execution_failed") == []
+
+
+def test_tool_timeout_failure_emits_execution_failed_metadata() -> None:
+    events = RuntimeEventLog()
+    registry = ToolRegistry()
+
+    def slow_tool(label: str) -> str:
+        time.sleep(0.05)
+        return label
+
+    registry.register(
+        name="slow_tool",
+        description="Sleep briefly.",
+        parameters_schema={
+            "type": "object",
+            "properties": {"label": {"type": "string"}},
+            "required": ["label"],
+            "additionalProperties": False,
+        },
+        func=slow_tool,
+        parallel_safe=True,
+    )
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                tool_call(
+                    "call_slow",
+                    name="slow_tool",
+                    arguments={"label": "too late"},
+                )
+            ),
+            final_response("not reached"),
+        ]
+    )
+    loop = build_loop(
+        provider,
+        registry,
+        events,
+        AgentToolLoopConfig(
+            tool_execution_mode="parallel",
+            tool_resource_limits=ToolResourceLimits(tool_timeout_ms=1),
+        ),
+    )
+
+    result = loop.run([{"role": "user", "content": "Use slow tool."}])
+
+    assert result.completed is False
+    assert result.tool_results[0].success is False
+    assert result.tool_results[0].error == "Tool execution timed out after 1ms"
+    failed = events.by_type("tool_execution_failed")[0]
+    assert failed.metadata["error_type"] == "ToolTimeoutError"
+    assert failed.metadata["error_category"] == "timeout"
+    assert failed.metadata["limit_name"] == "tool_timeout_ms"
+    assert failed.metadata["limit_value"] == 1
+    group_failure = events.by_type("tool_execution_group_failed")[0]
+    assert group_failure.metadata["timed_out_tool_count"] == 1
+
+
+def test_loop_start_and_group_metadata_include_resource_limit_summary() -> None:
+    events = RuntimeEventLog()
+    registry = add_registry()
+    provider = ScriptedProvider([tool_response(tool_call("call_add"))])
+    loop = build_loop(
+        provider,
+        registry,
+        events,
+        AgentToolLoopConfig(
+            tool_resource_limits=ToolResourceLimits(
+                max_tool_calls_per_loop=4,
+                max_tool_calls_per_round=2,
+                max_calls_per_tool={"add_numbers": 3},
+                tool_timeout_ms=500,
+            )
+        ),
+    )
+
+    loop.run([{"role": "user", "content": "Add numbers."}])
+
+    started = events.by_type("agent_tool_loop_started")[0]
+    assert started.metadata["tool_resource_limits_enabled"] is True
+    assert started.metadata["max_tool_calls_per_loop"] == 4
+    assert started.metadata["max_tool_calls_per_round"] == 2
+    assert started.metadata["max_calls_per_tool_count"] == 1
+    assert started.metadata["tool_timeout_ms"] == 500
+    group_started = events.by_type("tool_execution_group_started")[0]
+    assert group_started.metadata["resource_limits_enabled"] is True
+    assert group_started.metadata["max_tool_calls_per_loop"] == 4
+    assert group_started.metadata["max_tool_calls_per_round"] == 2
+    assert group_started.metadata["tool_timeout_ms"] == 500
 
 
 def test_multi_round_llm_provider_failure_in_followup_round() -> None:
