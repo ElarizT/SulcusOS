@@ -6,10 +6,10 @@ import time
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from kernel.agent_tool_loop import AgentToolLoop, AgentToolLoopConfig
+from agentos.runtime import AgentToolLoop, AgentToolLoopConfig
 from kernel.events import RuntimeEvent, RuntimeEventLog
-from kernel.llm import LLMRequest, LLMResponse, LLMRuntime, LLMToolCall
-from kernel.tools import ToolRegistry, ToolRuntime
+from agentos.llm import LLMRequest, LLMResponse, LLMRuntime, LLMToolCall
+from agentos.tools import ToolRegistry, ToolRuntime
 
 
 TIMELINE_EVENT_TYPES = {

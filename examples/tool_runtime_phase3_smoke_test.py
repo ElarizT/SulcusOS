@@ -3,7 +3,7 @@ import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from kernel.tools import ToolRegistry, ToolRuntime
+from agentos.tools import ToolRegistry, ToolRuntime
 
 
 def add_numbers(a: float, b: float) -> float:

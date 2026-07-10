@@ -3,7 +3,7 @@ import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from kernel.llm import (
+from agentos.llm import (
     LLMRuntime,
     OpenAICompatibleProvider,
     LLMToolDefinition,

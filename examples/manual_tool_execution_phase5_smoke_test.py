@@ -8,13 +8,13 @@ sys.path.insert(
     ),
 )
 
-from kernel.llm import (
+from agentos.llm import (
     LLMRuntime,
     OpenAICompatibleProvider,
     LLMToolDefinition,
 )
 
-from kernel.tools import (
+from agentos.tools import (
     ToolRegistry,
     ToolRuntime,
 )

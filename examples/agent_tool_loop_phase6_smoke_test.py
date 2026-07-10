@@ -3,10 +3,10 @@ import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from kernel.agent_tool_loop import AgentToolLoop
+from agentos.runtime import AgentToolLoop
 from kernel.events import RuntimeEventLog
-from kernel.llm import LLMRuntime, OpenAICompatibleProvider
-from kernel.tools import ToolRegistry, ToolRuntime
+from agentos.llm import LLMRuntime, OpenAICompatibleProvider
+from agentos.tools import ToolRegistry, ToolRuntime
 
 
 EXPECTED_TOOL_NAME = "add_numbers"

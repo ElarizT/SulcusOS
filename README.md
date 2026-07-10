@@ -56,6 +56,38 @@ Process Registry, workflow or recovery status, and WASM isolation status.
 - `docs/ipc_protocol.md` covers the structured Agent-to-Agent IPC protocol.
 - `docs/supervision.md` covers supervisor trees and restart policies.
 - `docs/persistent_memory.md` covers tiered persistent memory paging.
+- `docs/public_api.md` lists the supported Python API and migration guidance.
+
+## Public Python API
+
+Sulcus OS currently uses `agentos` as its Python import package for backward
+compatibility. New integrations should import from `agentos` rather than from
+implementation modules under `kernel.*`.
+
+```python
+from agentos import AgentProcess
+from agentos.runtime import AgentToolLoop, AgentToolLoopConfig
+from agentos.tools import ToolRegistry, ToolRuntime
+from agentos.llm import LLMRuntime
+```
+
+The top-level package is the compact stable API for processes, structured IPC,
+tool runtime, agent tool-loop controls, and native capability inspection.
+`agentos.runtime`, `agentos.tools`, `agentos.ipc`, and `agentos.native` are
+stable public submodules. `agentos.llm` is an advanced public submodule for
+provider-neutral integrations and may evolve through documented deprecations.
+
+`kernel.*` remains internal implementation. Existing imports continue to work,
+but new code should migrate, for example from `kernel.tools.ToolRegistry` to
+`agentos.tools.ToolRegistry`. Kernel imports do not currently warn because the
+Sulcus runtime uses them internally; they carry no external compatibility
+guarantee.
+
+The public LLM, tool, and agent-tool-loop APIs remain Python-only. Native
+dashboard, IPC, memory, and WASM execution require `agent_os_core`; inspect
+that capability through `agentos.native` without importing the raw extension.
+This is the intended pre-v1 API surface, not a claim of permanent semantic
+versioning before v1.0.
 
 ## External agents preview
 
@@ -244,7 +276,7 @@ through `AGENTOS_LLM_API_KEY`, `AGENTOS_LLM_BASE_URL`, `AGENTOS_LLM_MODEL`, and
 and tests remain offline and deterministic.
 
 ```python
-from kernel.llm import LLMRuntime, OpenAICompatibleProvider
+from agentos.llm import LLMRuntime, OpenAICompatibleProvider
 
 provider = OpenAICompatibleProvider(
     api_key="placeholder-key",
@@ -287,7 +319,7 @@ applied to each provider before the runtime moves to the next configured
 fallback. The default policy remains one attempt with no retry.
 
 ```python
-from kernel.llm import LLMRetryPolicy, LLMRuntime
+from agentos.llm import LLMRetryPolicy, LLMRuntime
 
 runtime = LLMRuntime(
     providers={...},
@@ -309,7 +341,7 @@ dependency. A budget overrun is a runtime guardrail failure, not a provider
 failure, so it does not trigger retries or fallbacks.
 
 ```python
-from kernel.llm import LLMRuntime, LLMTokenBudget
+from agentos.llm import LLMRuntime, LLMTokenBudget
 
 runtime = LLMRuntime(
     providers={...},
@@ -332,7 +364,7 @@ hits do not call providers or double-count provider usage. Cache events contain
 only safe provider/model fields and short opaque hashes, never prompt contents.
 
 ```python
-from kernel.llm import LLMResponseCache, LLMRuntime
+from agentos.llm import LLMResponseCache, LLMRuntime
 
 runtime = LLMRuntime(
     providers={...},
@@ -378,7 +410,7 @@ estimate, cache hits do not double-count, and no billing API or network access
 is used. The LLM Cost Monitor dashboard panel summarizes safe cost events.
 
 ```python
-from kernel.llm import LLMCostRate, LLMCostTable, LLMRuntime
+from agentos.llm import LLMCostRate, LLMCostTable, LLMRuntime
 
 cost_table = LLMCostTable([
     LLMCostRate(
@@ -405,7 +437,7 @@ into their native schema and map returned tool-call requests back into neutral
 `LLMToolCall` objects on `LLMResponse.tool_calls`.
 
 ```python
-from kernel.llm import LLMRuntime, LLMToolDefinition
+from agentos.llm import LLMRuntime, LLMToolDefinition
 
 tool = LLMToolDefinition(
     name="get_weather",
@@ -441,7 +473,7 @@ which validates required fields and basic JSON-schema-like types before calling
 the approved callable.
 
 ```python
-from kernel.tools import ToolRegistry, ToolRuntime
+from agentos.tools import ToolRegistry, ToolRuntime
 
 registry = ToolRegistry()
 
@@ -479,7 +511,7 @@ tools, feeds sanitized tool results back to the LLM, and stops at a final
 response, a pending approval point, a tool error, or `max_steps`.
 
 ```python
-from kernel.agent_tool_loop import AgentToolLoop
+from agentos.runtime import AgentToolLoop
 
 loop = AgentToolLoop(
     llm_runtime=llm_runtime,
@@ -671,7 +703,7 @@ they did before. A `ToolPermissionPolicy` can make tool access explicit with an
 allowlist, a denylist, or both:
 
 ```python
-from kernel.agent_tool_loop import AgentToolLoopConfig, ToolPermissionPolicy
+from agentos.runtime import AgentToolLoopConfig, ToolPermissionPolicy
 
 permissive = ToolPermissionPolicy()
 
@@ -719,7 +751,7 @@ Tool usage is unlimited by default for backwards compatibility. Configure
 `ToolResourceLimits` when an agent loop needs explicit runtime safety controls:
 
 ```python
-from kernel.agent_tool_loop import AgentToolLoopConfig, ToolResourceLimits
+from agentos.runtime import AgentToolLoopConfig, ToolResourceLimits
 
 config = AgentToolLoopConfig(
     tool_resource_limits=ToolResourceLimits(max_tool_calls_per_loop=4)
@@ -782,7 +814,7 @@ requested tools but before eligible tools execute. A paused result has
 tool ID, name, round, call index, and requested/effective execution modes.
 
 ```python
-from kernel.agent_tool_loop import ToolApprovalDecision
+from agentos.runtime import ToolApprovalDecision
 
 paused = loop.run(messages, tools, require_tool_approval=True)
 for item in paused.pending_approvals:

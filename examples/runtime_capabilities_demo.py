@@ -7,7 +7,7 @@ import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from kernel.native_core import get_runtime_capabilities
+from agentos.native import get_runtime_capabilities
 
 
 def main() -> int:
