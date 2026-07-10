@@ -111,32 +111,53 @@ v0.7 currently supports inspecting and running local Python `basic` agents only.
 
 For Windows test/development setup, see `docs/windows_dev_setup.md`.
 
-### 1) Python environment
+### 1) Python-only installation
 
 ```powershell
 py -3.14 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -U pip
-pip install -r requirements-dev.txt
+pip install -e .
+python examples\public_api_quickstart.py
 ```
 
-Install the native Python extension into the active virtual environment:
+The future distribution name is `sulcus-os`, while the import package remains
+`agentos` for backward compatibility. This source repository has not been
+published to PyPI yet, so use the editable install above.
+
+Optional integrations:
 
 ```powershell
+pip install -e .[openai]       # OpenAI-compatible provider SDK
+pip install -e .[dashboard]    # interactive dashboard dependencies
+pip install -e .[dev]          # tests and packaging tools
+```
+
+### 2) Native-core development (optional)
+
+Python-only LLM, tools, timelines, and agent tool-loop features do not require
+Rust. Dashboard, native IPC, memory, and WASM features require the extension:
+
+```powershell
+pip install -e .[native-dev]
 maturin develop
 ```
 
-### 2) Build Rust core
+### 3) Build Rust core
 
 ```powershell
 cargo build
 ```
 
-### 3) Run runtime
+### 4) Run runtime
 
 ```powershell
 python main.py
 ```
+
+Run `sulcus-check` after installation for a concise Python/native capability
+report. See `docs/installation.md` for editable installs, extras, wheel builds,
+and clean-environment testing.
 
 ### Native Core and Python-Only Mode
 

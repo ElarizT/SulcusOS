@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sulcus-os"
+dynamic = ["version"]
+description = "Python APIs for the experimental Sulcus OS agent runtime."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "LicenseRef-Unlicensed"
+keywords = ["agents", "llm", "orchestration", "tools", "runtime"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.urls]
+Homepage = "https://github.com/ElarizT/SulcusOS"
+Repository = "https://github.com/ElarizT/SulcusOS"
+Issues = "https://github.com/ElarizT/SulcusOS/issues"
+
+[project.optional-dependencies]
+dashboard = [
+    "rich>=13.7",
+    "textual>=0.58",
+]
+openai = ["openai>=1.30"]
+native-dev = ["maturin>=1.5"]
+dev = [
+    "build>=1.2",
+    "maturin>=1.5",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+sulcus-check = "agentos.cli:runtime_check_main"
+
+[tool.setuptools.dynamic]
+version = {attr = "agentos._version.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["agentos*", "kernel*"]
+exclude = ["tests*", "examples*", "docs*", "demos*"]
