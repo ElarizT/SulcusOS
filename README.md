@@ -106,6 +106,29 @@ cargo build
 python main.py
 ```
 
+### Native Core and Python-Only Mode
+
+`agent_os_core` is an optional boundary for imports, but it is required for the
+full dashboard runtime, native process registry primitives, native IPC, native
+memory operations, and the WASM sandbox. Install it in the active environment
+from the project root with `maturin develop`.
+
+Python-only functionality remains available without the extension: the LLM
+runtime, `ToolRegistry`, `ToolRuntime`, `AgentToolLoop`, resumable approvals,
+structured timelines, and their deterministic offline demos. Importing these
+modules does not start the dashboard or require native bindings.
+
+Check the active environment without failing when the extension is absent:
+
+```powershell
+python examples/runtime_capabilities_demo.py
+```
+
+Native-only pytest cases use the `requires_native_core` marker and skip with a
+clear reason when the extension is unavailable; Python-only tests continue to
+collect and run. Running `python main.py` without the extension prints the
+native installation command instead of a raw import traceback.
+
 ## Development
 
 Run tests:

@@ -20,6 +20,7 @@ from types import ModuleType
 from typing import Any
 
 from kernel.events import RuntimeEvent
+from kernel.native_core import native_core_available, require_native_core
 
 from kernel.ipc_protocol import (
     ErrorMessage,
@@ -34,9 +35,9 @@ from kernel.ipc_protocol import (
     parse_message,
 )
 
-try:
-    from agent_os_core import AgentMessage
-except ImportError:
+if native_core_available():
+    AgentMessage = require_native_core("native process messaging").AgentMessage
+else:
     @dataclass
     class AgentMessage:  # type: ignore[no-redef]
         sender: str

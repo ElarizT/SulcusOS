@@ -20,6 +20,13 @@ from kernel.ipc_protocol import (
     parse_message,
 )
 from kernel.process import AgentProcess, ExecutionMode, RestartPolicy, SupervisorStrategy
+from kernel.native_core import (
+    NativeCoreUnavailableError,
+    NativeCoreImportError,
+    RuntimeCapabilities,
+    get_runtime_capabilities,
+    native_core_available,
+)
 
 __all__ = [
     "AgentProcess",
@@ -34,6 +41,11 @@ __all__ = [
     "IPCProtocolError",
     "RestartPolicy",
     "SupervisorStrategy",
+    "NativeCoreUnavailableError",
+    "NativeCoreImportError",
+    "RuntimeCapabilities",
+    "get_runtime_capabilities",
+    "native_core_available",
     "TaskRequest",
     "TaskResponse",
     "make_error",

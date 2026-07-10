@@ -4,7 +4,13 @@ import sys
 
 try:
     print("1. Testing Native Core Component Bindings...")
-    from agent_os_core import RustKernel, NativeIPCBus, ContextMemoryManager, WasmSandboxManager
+    from kernel.native_core import require_native_core
+
+    native_core = require_native_core("native debug runtime")
+    RustKernel = native_core.RustKernel
+    NativeIPCBus = native_core.NativeIPCBus
+    ContextMemoryManager = native_core.ContextMemoryManager
+    WasmSandboxManager = native_core.WasmSandboxManager
     kernel = RustKernel()
     bus = NativeIPCBus(kernel)
     memory = ContextMemoryManager(max_active_tokens=8000)

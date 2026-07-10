@@ -13,15 +13,9 @@ from pathlib import Path
 from typing import Any
 
 from agentos.loader import inspect_external_agent
-from agent_os_core import (
-    AgentMessage,
-    ContextMemoryManager,
-    NativeIPCBus,
-    RustKernel,
-    WasmSandboxManager,
-)
 from kernel.dashboard import SHELL_PROMPT, AgentOSDashboard
 from kernel.memory_store import PersistentMemoryManager
+from kernel.native_core import require_native_core
 from kernel.process import ProcessRegistry
 from kernel.shell_help import (
     DEMO_COMMANDS,
@@ -586,7 +580,16 @@ def seed_boot_task(bus: NativeIPCBus, registry: DynamicAgentRegistry) -> None:
     )
 
 
-async def main() -> None:
+async def run_dashboard() -> None:
+    native_core = require_native_core("full dashboard runtime")
+    # Runtime functions resolve these names only after the native dependency is
+    # explicitly checked. Importing ``main`` therefore remains Python-only.
+    global AgentMessage, ContextMemoryManager, NativeIPCBus, RustKernel, WasmSandboxManager
+    AgentMessage = native_core.AgentMessage
+    ContextMemoryManager = native_core.ContextMemoryManager
+    NativeIPCBus = native_core.NativeIPCBus
+    RustKernel = native_core.RustKernel
+    WasmSandboxManager = native_core.WasmSandboxManager
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
     llm_manager = None
@@ -783,5 +786,19 @@ async def main() -> None:
             loop.remove_signal_handler(signal.SIGINT)
 
 
+def main() -> int:
+    """Run the native dashboard and render an actionable missing-core error."""
+    try:
+        asyncio.run(run_dashboard())
+    except Exception as exc:
+        from kernel.native_core import NativeCoreUnavailableError
+
+        if isinstance(exc, NativeCoreUnavailableError):
+            print(str(exc))
+            return 1
+        raise
+    return 0
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(main())
