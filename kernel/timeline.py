@@ -67,7 +67,10 @@ def format_timeline_event(event: RuntimeEvent) -> str:
     timestamp = event.timestamp.astimezone(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
     category, action = _event_parts(event)
     subject = _event_subject(event)
-    metadata = _metadata_summary(event.metadata)
+    metadata = _metadata_summary(
+        event.metadata,
+        include_approval_fields="approval" in event.event_type or "paused" in event.event_type or "resumed" in event.event_type,
+    )
     row = f"{timestamp}  {category:<16} {subject:<18} {action}"
     return f"{row}  {metadata}" if metadata else row
 
@@ -113,9 +116,10 @@ def _event_subject(event: RuntimeEvent) -> str:
     return _normalize(event.source)
 
 
-def _metadata_summary(metadata: Mapping[str, Any]) -> str:
+def _metadata_summary(metadata: Mapping[str, Any], *, include_approval_fields: bool = False) -> str:
     parts: list[str] = []
-    for key in _METADATA_KEYS:
+    keys = _METADATA_KEYS + (("tool_call_id", "call_index", "pending_approval_count") if include_approval_fields else ())
+    for key in keys:
         value = metadata.get(key)
         if key in _SUBJECT_KEYS or not _is_short_scalar(value):
             continue

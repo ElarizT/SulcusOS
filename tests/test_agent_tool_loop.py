@@ -3,9 +3,12 @@ from __future__ import annotations
 import time
 from typing import Any
 
+import pytest
+
 from kernel.agent_tool_loop import (
     AgentToolLoop,
     AgentToolLoopConfig,
+    ToolApprovalDecision,
     ToolPermissionPolicy,
     ToolResourceLimits,
 )
@@ -1767,6 +1770,109 @@ def test_require_tool_approval_returns_pending_without_executing() -> None:
     assert executions == []
     assert len(provider.requests) == 1
     assert events.by_type("agent_tool_loop.approval_required")
+
+
+def test_approval_resume_executes_without_repeating_llm_request() -> None:
+    executions: list[tuple[float, float]] = []
+    call = tool_call("approve-1")
+    provider = ScriptedProvider([tool_response(call), final_response("done")])
+    events = RuntimeEventLog()
+    loop = build_loop(provider, add_registry(executions), events)
+
+    paused = loop.run(
+        [{"role": "user", "content": "calculate"}], [add_tool_definition()],
+        require_tool_approval=True,
+    )
+    assert paused.checkpoint is not None
+    assert paused.pending_approvals[0].tool_call_id == "approve-1"
+    resumed = loop.resume(
+        checkpoint=paused.checkpoint,
+        approval_decisions=[ToolApprovalDecision("approve-1", approved=True)],
+    )
+
+    assert resumed.completed is True
+    assert resumed.final_response == final_response("done")
+    assert executions == [(15, 27)]
+    assert len(provider.requests) == 2
+    event_types = [event.event_type for event in events.events]
+    assert event_types.index("tool_approval_requested") < event_types.index("agent_tool_loop_paused")
+    assert event_types.index("agent_tool_loop_paused") < event_types.index("agent_tool_loop_resumed")
+    assert event_types.index("agent_tool_loop_resumed") < event_types.index("tool_approval_granted")
+
+
+def test_approval_denial_returns_tool_result_and_consumes_checkpoint() -> None:
+    executions: list[tuple[float, float]] = []
+    call = tool_call("deny-1")
+    provider = ScriptedProvider([tool_response(call), final_response("done")])
+    loop = build_loop(provider, add_registry(executions))
+    paused = loop.run([{"role": "user", "content": "calculate"}], [add_tool_definition()], require_tool_approval=True)
+    assert paused.checkpoint is not None
+    resumed = loop.resume(checkpoint=paused.checkpoint, approval_decisions=[ToolApprovalDecision("deny-1", False)])
+    assert resumed.completed is False  # default stop_on_tool_error
+    assert resumed.reason == "tool_error"
+    assert executions == []
+    assert resumed.tool_results[0].error == "Tool call denied by approval: add_numbers"
+    with pytest.raises(ValueError, match="already been consumed"):
+        loop.resume(checkpoint=paused.checkpoint, approval_decisions=[ToolApprovalDecision("deny-1", False)])
+
+
+def test_partial_approval_keeps_checkpoint_pending() -> None:
+    first = tool_call("first")
+    second = tool_call("second")
+    provider = ScriptedProvider([tool_response(first, second)])
+    loop = build_loop(provider, arithmetic_registry())
+    paused = loop.run([{"role": "user", "content": "calculate"}], [add_tool_definition(), multiply_tool_definition()], require_tool_approval=True)
+    assert paused.checkpoint is not None
+    still_paused = loop.resume(checkpoint=paused.checkpoint, approval_decisions=[ToolApprovalDecision("first", True)])
+    assert still_paused.checkpoint == paused.checkpoint
+    assert still_paused.reason == "approval_required"
+
+
+def test_approval_preflight_permission_and_limits_do_not_become_pending() -> None:
+    allowed = tool_call("allowed")
+    denied = tool_call("denied", name="multiply_numbers")
+    provider = ScriptedProvider([tool_response(allowed, denied)])
+    loop = build_loop(provider, arithmetic_registry())
+    paused = loop.run(
+        [{"role": "user", "content": "calculate"}],
+        [add_tool_definition(), multiply_tool_definition()], require_tool_approval=True,
+        tool_permission_policy=ToolPermissionPolicy(denied_tools={"multiply_numbers"}),
+    )
+    assert [item.tool_call_id for item in paused.pending_approvals] == ["allowed"]
+
+
+def test_approval_resume_does_not_charge_resource_limit_twice() -> None:
+    executions: list[tuple[float, float]] = []
+    call = tool_call("limited")
+    provider = ScriptedProvider([tool_response(call), final_response("done")])
+    loop = build_loop(provider, add_registry(executions))
+    paused = loop.run(
+        [{"role": "user", "content": "calculate"}], [add_tool_definition()],
+        require_tool_approval=True,
+        tool_resource_limits=ToolResourceLimits(max_tool_calls_per_loop=1),
+    )
+    assert paused.checkpoint is not None
+    resumed = loop.resume(checkpoint=paused.checkpoint, approval_decisions=[ToolApprovalDecision("limited", True)])
+    assert resumed.completed is True
+    assert executions == [(15, 27)]
+
+
+def test_approval_parallel_resume_preserves_requested_order() -> None:
+    executions: list[tuple[str, float, float]] = []
+    first = tool_call("parallel-add")
+    second = tool_call("parallel-multiply", name="multiply_numbers")
+    provider = ScriptedProvider([tool_response(first, second), final_response("done")])
+    loop = build_loop(provider, arithmetic_registry(executions, parallel_safe=True))
+    paused = loop.run(
+        [{"role": "user", "content": "calculate"}], [add_tool_definition(), multiply_tool_definition()],
+        require_tool_approval=True, tool_execution_mode="parallel",
+    )
+    assert paused.checkpoint is not None
+    assert {item.effective_execution_mode for item in paused.pending_approvals} == {"parallel"}
+    resumed = loop.resume(checkpoint=paused.checkpoint, approval_decisions=[
+        ToolApprovalDecision("parallel-add", True), ToolApprovalDecision("parallel-multiply", True),
+    ])
+    assert [result.tool_call_id for result in resumed.tool_results] == ["parallel-add", "parallel-multiply"]
 
 
 def test_llm_provider_failure_emits_failed_timeline_events() -> None:

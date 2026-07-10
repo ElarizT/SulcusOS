@@ -690,9 +690,6 @@ Run the offline deterministic permission demo:
 python examples/agent_tool_loop_tool_permission_demo.py
 ```
 
-<<<<<<< HEAD
-Will be updated
-=======
 ### Tool Resource Limits
 
 Tool usage is unlimited by default for backwards compatibility. Configure
@@ -752,4 +749,46 @@ Run the offline deterministic resource-limit demo:
 ```powershell
 python examples/agent_tool_loop_resource_limits_demo.py
 ```
->>>>>>> aa4e660 (Add tool resource limits)
+
+### Resumable Tool Approval
+
+Set `require_tool_approval=True` to pause an `AgentToolLoop` after the LLM has
+requested tools but before eligible tools execute. A paused result has
+`reason="approval_required"`, `pending_approvals`, and an in-memory
+`checkpoint`. Each pending item exposes only safe call metadata such as the
+tool ID, name, round, call index, and requested/effective execution modes.
+
+```python
+from kernel.agent_tool_loop import ToolApprovalDecision
+
+paused = loop.run(messages, tools, require_tool_approval=True)
+for item in paused.pending_approvals:
+    print(item.tool_name, item.tool_call_id)
+
+resumed = loop.resume(
+    checkpoint=paused.checkpoint,
+    approval_decisions=[ToolApprovalDecision("call-1", approved=True)],
+)
+```
+
+Approve or deny every pending call to consume a checkpoint. A partial decision
+set leaves it paused; unknown or duplicate IDs, incompatible loop/runtime
+state, and reused checkpoints fail safely. Approval-denied calls produce normal
+failed tool results (`approval_denied`) and never execute. The original LLM
+response is retained, so resume does not repeat its LLM request and preserves
+history, steps, and resource counters.
+
+Permission and resource checks run before approval: permission- or
+resource-denied calls are not offered for approval, and approval cannot override
+either decision. In parallel mode only approved, parallel-safe calls can be
+submitted; the existing sequential fallback and original call-result order are
+preserved. Approval lifecycle events are `tool_approval_requested`,
+`agent_tool_loop_paused`, `tool_approval_granted`, `tool_approval_denied`, and
+`agent_tool_loop_resumed`; their metadata excludes argument values and approval
+comments. Checkpoints are in-memory only in this release.
+
+Run the offline demo:
+
+```powershell
+python examples/agent_tool_loop_approval_resume_demo.py
+```

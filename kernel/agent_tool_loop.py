@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, replace
 from typing import Any, Literal
+from uuid import uuid4
 
 from kernel.events import RuntimeEvent
 from kernel.llm.providers import classify_llm_error
@@ -111,6 +112,73 @@ class ToolResourceLimits:
 
 
 @dataclass(frozen=True)
+class ToolApprovalDecision:
+    """Caller decision for one pending tool call.
+
+    ``reason`` is deliberately not copied into runtime events or tool feedback.
+    It is useful to a caller's own audit trail only.
+    """
+
+    tool_call_id: str
+    approved: bool
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.tool_call_id, str) or not self.tool_call_id.strip():
+            raise ValueError("tool_call_id must be a nonempty string")
+        if not isinstance(self.approved, bool):
+            raise ValueError("approved must be a boolean")
+        if self.reason is not None and not isinstance(self.reason, str):
+            raise ValueError("reason must be a string or None")
+
+
+@dataclass(frozen=True)
+class PendingToolApproval:
+    """Safe, inspectable metadata for a tool call awaiting caller approval."""
+
+    tool_call_id: str
+    tool_name: str
+    round_index: int
+    call_index: int
+    requested_execution_mode: ToolExecutionMode
+    effective_execution_mode: ToolExecutionMode
+
+
+@dataclass(frozen=True)
+class AgentToolLoopCheckpoint:
+    """In-memory resume state for a paused approval round.
+
+    This intentionally contains tool definitions and call data, but never a
+    registered Python callable. Resume validates those definitions against the
+    live ToolRuntime registry owned by the same loop instance.
+    """
+
+    checkpoint_version: int
+    checkpoint_id: str
+    loop_id: str
+    round_index: int
+    history: tuple[LLMMessage, ...]
+    response: LLMResponse
+    tool_definitions: tuple[LLMToolDefinition, ...]
+    allowed_tool_names: frozenset[str]
+    config: "AgentToolLoopConfig"
+    steps: tuple["AgentToolLoopStep", ...]
+    tool_results: tuple[LLMToolResult, ...]
+    pending_approvals: tuple[PendingToolApproval, ...]
+    preflight_outcomes: tuple["_ToolOutcome | None", ...]
+    requested_execution_mode: ToolExecutionMode
+    effective_execution_mode: ToolExecutionMode
+    fallback_reason: str | None
+    parallel_safe_tool_count: int
+    unsafe_tool_count: int
+    total_requested: int
+    round_requested: tuple[tuple[int, int], ...]
+    tool_requested: tuple[tuple[str, int], ...]
+    provider: str
+    model: str
+
+
+@dataclass(frozen=True)
 class AgentToolLoopConfig:
     """Conservative controls for bounded LLM-tool orchestration.
 
@@ -194,6 +262,10 @@ class AgentToolLoopResult:
     final_response: LLMResponse | None = None
     steps: tuple[AgentToolLoopStep, ...] = ()
     pending_tool_calls: tuple[LLMToolCall, ...] = ()
+    pending_approvals: tuple[PendingToolApproval, ...] = ()
+    checkpoint: AgentToolLoopCheckpoint | None = None
+    current_round_index: int | None = None
+    current_step_index: int | None = None
     tool_results: tuple[LLMToolResult, ...] = ()
 
     def __post_init__(self) -> None:
@@ -203,6 +275,7 @@ class AgentToolLoopResult:
             raise ValueError("result reason must not be empty")
         object.__setattr__(self, "steps", tuple(self.steps))
         object.__setattr__(self, "pending_tool_calls", tuple(self.pending_tool_calls))
+        object.__setattr__(self, "pending_approvals", tuple(self.pending_approvals))
         object.__setattr__(self, "tool_results", tuple(self.tool_results))
 
 
@@ -290,6 +363,23 @@ class _ToolResourceLimitState:
             )
         return _ToolResourceDecision(True)
 
+    def snapshot(self) -> tuple[int, tuple[tuple[int, int], ...], tuple[tuple[str, int], ...]]:
+        return (self.total_requested, tuple(sorted(self.round_requested.items())), tuple(sorted(self.tool_requested.items())))
+
+    @classmethod
+    def from_snapshot(
+        cls,
+        limits: ToolResourceLimits | None,
+        total_requested: int,
+        round_requested: Sequence[tuple[int, int]],
+        tool_requested: Sequence[tuple[str, int]],
+    ) -> "_ToolResourceLimitState":
+        state = cls(limits)
+        state.total_requested = total_requested
+        state.round_requested = dict(round_requested)
+        state.tool_requested = dict(tool_requested)
+        return state
+
 
 class AgentToolLoop:
     """Explicitly orchestrate LLM tool calls through ToolRuntime."""
@@ -314,6 +404,8 @@ class AgentToolLoop:
         self.event_sink = (
             event_sink if event_sink is not None else getattr(llm_runtime, "event_sink", None)
         )
+        self._loop_id = uuid4().hex
+        self._consumed_checkpoints: set[str] = set()
 
     def run(
         self,
@@ -334,9 +426,11 @@ class AgentToolLoop:
         include_intermediate_steps: bool | None = None,
         tool_permission_policy: ToolPermissionPolicy | None = None,
         tool_resource_limits: ToolResourceLimits | None = None,
+        _checkpoint: AgentToolLoopCheckpoint | None = None,
+        _approval_decisions: Mapping[str, ToolApprovalDecision] | None = None,
     ) -> AgentToolLoopResult:
         """Run a bounded explicit LLM -> tool -> LLM loop."""
-        config = _resolve_config(
+        config = (_checkpoint.config if _checkpoint is not None else _resolve_config(
             self.config,
             max_steps=max_steps,
             require_tool_approval=require_tool_approval,
@@ -346,22 +440,28 @@ class AgentToolLoop:
             include_intermediate_steps=include_intermediate_steps,
             tool_permission_policy=tool_permission_policy,
             tool_resource_limits=tool_resource_limits,
-        )
+        ))
         if config.allow_parallel_tool_calls:
             raise ValueError("parallel tool calls are not supported yet")
 
-        history = tuple(_coerce_message(message) for message in messages)
-        tool_definitions = self._coerce_tool_definitions(tools)
-        allowed_tool_names = frozenset(tool.name for tool in tool_definitions)
+        history = (_checkpoint.history if _checkpoint is not None else tuple(_coerce_message(message) for message in messages))
+        tool_definitions = (_checkpoint.tool_definitions if _checkpoint is not None else self._coerce_tool_definitions(tools))
+        allowed_tool_names = (_checkpoint.allowed_tool_names if _checkpoint is not None else frozenset(tool.name for tool in tool_definitions))
         permission_policy = config.tool_permission_policy or ToolPermissionPolicy()
         policy_summary = _tool_permission_policy_summary(config.tool_permission_policy)
-        resource_limit_state = _ToolResourceLimitState(config.tool_resource_limits)
+        resource_limit_state = (_ToolResourceLimitState.from_snapshot(
+            config.tool_resource_limits,
+            _checkpoint.total_requested,
+            _checkpoint.round_requested,
+            _checkpoint.tool_requested,
+        ) if _checkpoint is not None else _ToolResourceLimitState(config.tool_resource_limits))
         resource_limit_summary = _tool_resource_limits_summary(config.tool_resource_limits)
         route_metadata = _runtime_route_metadata(self.llm_runtime, provider, model)
-        steps: list[AgentToolLoopStep] = []
-        all_tool_results: list[LLMToolResult] = []
+        steps: list[AgentToolLoopStep] = list(_checkpoint.steps) if _checkpoint is not None else []
+        all_tool_results: list[LLMToolResult] = list(_checkpoint.tool_results) if _checkpoint is not None else []
 
-        self._emit(
+        if _checkpoint is None:
+            self._emit(
             "agent_tool_loop_started",
             "Agent tool loop started",
             {
@@ -378,7 +478,7 @@ class AgentToolLoop:
                 **_agent_metadata(metadata),
             },
         )
-        self._emit(
+            self._emit(
             "agent_tool_loop.started",
             "Agent tool loop started",
             {
@@ -388,7 +488,8 @@ class AgentToolLoop:
             },
         )
 
-        for step_index in range(config.max_steps):
+        for step_index in range(_checkpoint.round_index if _checkpoint is not None else 0, config.max_steps):
+            resuming_round = _checkpoint is not None and step_index == _checkpoint.round_index
             history_tool_results = tuple(
                 message for message in history if message.role == "tool"
             )
@@ -446,15 +547,19 @@ class AgentToolLoop:
                 },
             )
             try:
-                response = self.llm_runtime.chat(
-                    history,
-                    model=model,
-                    temperature=temperature,
-                    metadata=metadata,
-                    provider=provider,
-                    timeout_seconds=timeout_seconds,
-                    tools=tool_definitions,
-                    tool_choice=tool_choice,
+                response = (
+                    _checkpoint.response
+                    if resuming_round
+                    else self.llm_runtime.chat(
+                        history,
+                        model=model,
+                        temperature=temperature,
+                        metadata=metadata,
+                        provider=provider,
+                        timeout_seconds=timeout_seconds,
+                        tools=tool_definitions,
+                        tool_choice=tool_choice,
+                    )
                 )
             except Exception as exc:
                 error_category = classify_llm_error(exc)
@@ -509,7 +614,8 @@ class AgentToolLoop:
                 provider=response.provider,
                 model=response.model,
             )
-            steps.append(llm_step)
+            if not resuming_round:
+                steps.append(llm_step)
 
             final_response_received = bool(history_tool_results) and not response.tool_calls
             self._emit(
@@ -603,56 +709,121 @@ class AgentToolLoop:
                 },
             )
 
-            if config.require_tool_approval:
-                steps.append(
-                    AgentToolLoopStep(
-                        index=step_index,
-                        kind="approval_required",
-                        tool_calls=response.tool_calls,
-                        success=False,
-                        provider=response.provider,
-                        model=response.model,
+            if config.require_tool_approval and not resuming_round:
+                history = (*history, assistant_tool_call_message(response))
+                permission_decisions = tuple(
+                    permission_policy.check(tool_call.name) for tool_call in response.tool_calls
+                )
+                preflight: list[_ToolOutcome | None] = []
+                approvable: list[tuple[int, LLMToolCall]] = []
+                for call_index, (tool_call, permission_decision) in enumerate(
+                    zip(response.tool_calls, permission_decisions)
+                ):
+                    self._emit_tool_call_requested(
+                        tool_call, step_index, config.tool_execution_mode,
+                        response.provider, response.model,
                     )
+                    resource_decision = resource_limit_state.record_requested(
+                        tool_call, round_index=step_index
+                    )
+                    if not permission_decision.allowed:
+                        preflight.append(self._deny_tool_call(
+                            tool_call, permission_decision, step_index=step_index,
+                            max_steps=config.max_steps,
+                            requested_execution_mode=config.tool_execution_mode,
+                            effective_execution_mode="sequential", provider=response.provider,
+                            model=response.model,
+                        ))
+                    elif not resource_decision.allowed:
+                        preflight.append(self._resource_deny_tool_call(
+                            tool_call, resource_decision, step_index=step_index,
+                            max_steps=config.max_steps,
+                            requested_execution_mode=config.tool_execution_mode,
+                            effective_execution_mode="sequential", provider=response.provider,
+                            model=response.model,
+                        ))
+                    else:
+                        preflight.append(None)
+                        approvable.append((call_index, tool_call))
+                resolved_mode = _resolve_tool_execution_group_mode(
+                    requested_execution_mode=config.tool_execution_mode,
+                    tool_calls=tuple(call for _, call in approvable), registry=self.tool_runtime.registry,
                 )
-                self._emit(
-                    "agent_tool_loop.approval_required",
-                    "Agent tool loop approval required",
-                    {
-                        "step_index": step_index,
-                        "max_steps": config.max_steps,
-                        "tool_count": len(response.tool_calls),
-                        "tool_names": tool_names,
-                        "success": False,
-                        "provider": response.provider,
-                        "model": response.model,
-                    },
-                    warning=True,
+                pending = tuple(
+                    PendingToolApproval(
+                        tool_call_id=call.id, tool_name=call.name, round_index=step_index,
+                        call_index=index, requested_execution_mode=config.tool_execution_mode,
+                        effective_execution_mode=resolved_mode.effective_execution_mode,
+                    ) for index, call in approvable
                 )
-                self._emit(
-                    "agent_tool_loop_failed",
-                    "Agent tool loop approval required",
-                    {
-                        "completed": False,
-                        "reason": "approval_required",
-                        "round_index": step_index,
-                        "step_index": step_index,
-                        "tool_call_count": len(response.tool_calls),
-                        "tool_names": tool_names,
-                        "provider": response.provider,
-                        "model": response.model,
-                    },
-                    warning=True,
-                )
-                return self._result(
-                    completed=False,
-                    reason="approval_required",
-                    steps=steps,
-                    config=config,
-                    pending_tool_calls=response.tool_calls,
-                    tool_results=all_tool_results,
-                )
+                if pending:
+                    total_requested, round_requested, tool_requested = resource_limit_state.snapshot()
+                    paused_step = AgentToolLoopStep(
+                        index=step_index, kind="approval_required", tool_calls=response.tool_calls,
+                        success=False, provider=response.provider, model=response.model,
+                    )
+                    checkpoint = AgentToolLoopCheckpoint(
+                        checkpoint_version=1, checkpoint_id=uuid4().hex, loop_id=self._loop_id,
+                        round_index=step_index, history=history, response=response,
+                        tool_definitions=tool_definitions, allowed_tool_names=allowed_tool_names,
+                        config=config, steps=(*steps, paused_step), tool_results=tuple(all_tool_results),
+                        pending_approvals=pending, preflight_outcomes=tuple(preflight),
+                        requested_execution_mode=config.tool_execution_mode,
+                        effective_execution_mode=resolved_mode.effective_execution_mode,
+                        fallback_reason=resolved_mode.fallback_reason,
+                        parallel_safe_tool_count=resolved_mode.parallel_safe_tool_count,
+                        unsafe_tool_count=resolved_mode.unsafe_tool_count,
+                        total_requested=total_requested, round_requested=round_requested,
+                        tool_requested=tool_requested, provider=response.provider, model=response.model,
+                    )
+                    steps.append(paused_step)
+                    for approval in pending:
+                        self._emit("tool_approval_requested", "Tool approval requested", {
+                            "round_index": step_index, "step_index": step_index,
+                            "tool_call_id": approval.tool_call_id, "tool_name": approval.tool_name,
+                            "call_index": approval.call_index, "pending_approval_count": len(pending),
+                            "requested_execution_mode": approval.requested_execution_mode,
+                            "effective_execution_mode": approval.effective_execution_mode,
+                        }, warning=True)
+                    self._emit("agent_tool_loop_paused", "Agent tool loop paused for approval", {
+                        "round_index": step_index, "step_index": step_index,
+                        "pending_approval_count": len(pending),
+                    }, warning=True)
+                    self._emit("agent_tool_loop.approval_required", "Agent tool loop approval required", {
+                        "step_index": step_index, "max_steps": config.max_steps,
+                        "tool_count": len(response.tool_calls), "tool_names": tool_names,
+                        "success": False, "provider": response.provider, "model": response.model,
+                    }, warning=True)
+                    return self._result(
+                        completed=False, reason="approval_required", steps=steps, config=config,
+                        pending_tool_calls=tuple(response.tool_calls[index] for index, _ in approvable),
+                        pending_approvals=pending, checkpoint=checkpoint,
+                        current_round_index=step_index, current_step_index=step_index,
+                        tool_results=all_tool_results,
+                    )
+                # Nothing passed preflight, so approval is irrelevant. Feed the
+                # already-accounted denial results back to the LLM without
+                # charging this attempted group a second time.
+                outcomes = [outcome for outcome in preflight if outcome is not None]
+                all_tool_results.extend(outcome.llm_result for outcome in outcomes)
+                failed_outcome = next((outcome for outcome in outcomes if not outcome.success), None)
+                steps.append(AgentToolLoopStep(
+                    index=step_index, kind="tool_execution", tool_calls=response.tool_calls,
+                    tool_results=tuple(outcome.llm_result for outcome in outcomes),
+                    success=failed_outcome is None,
+                    error_type=None if failed_outcome is None else failed_outcome.error_type,
+                    error_category=None if failed_outcome is None else failed_outcome.error_category,
+                    provider=response.provider, model=response.model,
+                ))
+                if failed_outcome is not None and config.stop_on_tool_error:
+                    return self._result(
+                        completed=False, reason="tool_error", steps=steps, config=config,
+                        tool_results=all_tool_results,
+                    )
+                history = (*history, *(tool_result_message(outcome.llm_result) for outcome in outcomes))
+                continue
 
-            if step_index + 1 >= config.max_steps:
+            if step_index + 1 >= config.max_steps and not resuming_round:
                 self._emit_max_steps_exceeded(
                     step_index=step_index,
                     max_steps=config.max_steps,
@@ -668,10 +839,8 @@ class AgentToolLoop:
                     tool_results=all_tool_results,
                 )
 
-            history = (
-                *history,
-                assistant_tool_call_message(response),
-            )
+            if not resuming_round:
+                history = (*history, assistant_tool_call_message(response))
             permission_decisions = tuple(
                 permission_policy.check(tool_call.name)
                 for tool_call in response.tool_calls
@@ -682,11 +851,16 @@ class AgentToolLoop:
                 if decision.allowed
             )
             denied_tool_count = len(response.tool_calls) - len(permitted_tool_calls)
-            resolved_mode = _resolve_tool_execution_group_mode(
+            resolved_mode = (_ResolvedToolExecutionMode(
+                _checkpoint.effective_execution_mode,
+                _checkpoint.fallback_reason,
+                _checkpoint.parallel_safe_tool_count,
+                _checkpoint.unsafe_tool_count,
+            ) if resuming_round else _resolve_tool_execution_group_mode(
                 requested_execution_mode=config.tool_execution_mode,
                 tool_calls=permitted_tool_calls,
                 registry=self.tool_runtime.registry,
-            )
+            ))
             group_metadata = _tool_execution_group_metadata(
                 requested_execution_mode=config.tool_execution_mode,
                 effective_execution_mode=resolved_mode.effective_execution_mode,
@@ -709,19 +883,34 @@ class AgentToolLoop:
                 "Agent tool loop tool execution group started",
                 group_metadata,
             )
-            outcomes = self._execute_tool_group(
-                response.tool_calls,
-                allowed_tool_names=allowed_tool_names,
-                permission_decisions=permission_decisions,
-                step_index=step_index,
-                max_steps=config.max_steps,
-                requested_execution_mode=config.tool_execution_mode,
-                effective_execution_mode=resolved_mode.effective_execution_mode,
-                resource_limit_state=resource_limit_state,
-                tool_resource_limits=config.tool_resource_limits,
-                provider=response.provider,
-                model=response.model,
-                stop_on_tool_error=config.stop_on_tool_error,
+            outcomes = (
+                self._execute_approved_tool_group(
+                    response.tool_calls,
+                    preflight_outcomes=_checkpoint.preflight_outcomes,
+                    decisions=_approval_decisions or {},
+                    allowed_tool_names=allowed_tool_names,
+                    step_index=step_index,
+                    max_steps=config.max_steps,
+                    requested_execution_mode=_checkpoint.requested_execution_mode,
+                    effective_execution_mode=_checkpoint.effective_execution_mode,
+                    tool_resource_limits=config.tool_resource_limits,
+                    provider=response.provider,
+                    model=response.model,
+                    stop_on_tool_error=config.stop_on_tool_error,
+                ) if resuming_round else self._execute_tool_group(
+                    response.tool_calls,
+                    allowed_tool_names=allowed_tool_names,
+                    permission_decisions=permission_decisions,
+                    step_index=step_index,
+                    max_steps=config.max_steps,
+                    requested_execution_mode=config.tool_execution_mode,
+                    effective_execution_mode=resolved_mode.effective_execution_mode,
+                    resource_limit_state=resource_limit_state,
+                    tool_resource_limits=config.tool_resource_limits,
+                    provider=response.provider,
+                    model=response.model,
+                    stop_on_tool_error=config.stop_on_tool_error,
+                )
             )
             executed_tool_calls = tuple(
                 tool_call
@@ -847,6 +1036,62 @@ class AgentToolLoop:
             tool_results=all_tool_results,
         )
 
+    def resume(
+        self,
+        *,
+        checkpoint: AgentToolLoopCheckpoint,
+        approval_decisions: Sequence[ToolApprovalDecision],
+    ) -> AgentToolLoopResult:
+        """Resume a paused approval round without repeating its LLM request."""
+        if not isinstance(checkpoint, AgentToolLoopCheckpoint):
+            raise TypeError("checkpoint must be an AgentToolLoopCheckpoint")
+        if checkpoint.checkpoint_version != 1:
+            raise ValueError("unsupported checkpoint_version")
+        if checkpoint.loop_id != self._loop_id:
+            raise ValueError("checkpoint belongs to a different AgentToolLoop instance")
+        if checkpoint.checkpoint_id in self._consumed_checkpoints:
+            raise ValueError("checkpoint has already been consumed")
+        pending_ids = {approval.tool_call_id for approval in checkpoint.pending_approvals}
+        decisions: dict[str, ToolApprovalDecision] = {}
+        for decision in approval_decisions:
+            if not isinstance(decision, ToolApprovalDecision):
+                raise TypeError("approval_decisions must contain ToolApprovalDecision values")
+            if decision.tool_call_id not in pending_ids:
+                raise ValueError("approval decision references an unknown or resolved tool call")
+            if decision.tool_call_id in decisions:
+                raise ValueError("duplicate approval decision for tool call")
+            decisions[decision.tool_call_id] = decision
+        if set(decisions) != pending_ids:
+            # Partial submissions are intentionally non-consuming and leave the
+            # same checkpoint inspectable until every pending call is decided.
+            return self._result(
+                completed=False, reason="approval_required", config=checkpoint.config,
+                steps=checkpoint.steps,
+                pending_tool_calls=tuple(
+                    call for call in checkpoint.response.tool_calls if call.id in pending_ids
+                ),
+                pending_approvals=checkpoint.pending_approvals, checkpoint=checkpoint,
+                current_round_index=checkpoint.round_index,
+                current_step_index=checkpoint.round_index,
+                tool_results=checkpoint.tool_results,
+            )
+        for definition in checkpoint.tool_definitions:
+            registered = self.tool_runtime.registry.get(definition.name)
+            if registered is None:
+                raise ValueError("checkpoint tool is no longer registered")
+            if registered.to_llm_tool_definition().parameters_schema != definition.parameters_schema:
+                raise ValueError("checkpoint tool definitions are incompatible with the registry")
+        self._consumed_checkpoints.add(checkpoint.checkpoint_id)
+        self._emit("agent_tool_loop_resumed", "Agent tool loop resumed", {
+            "round_index": checkpoint.round_index, "step_index": checkpoint.round_index,
+            "pending_approval_count": len(checkpoint.pending_approvals),
+            "requested_execution_mode": checkpoint.requested_execution_mode,
+            "effective_execution_mode": checkpoint.effective_execution_mode,
+        })
+        return self.run(
+            (), (), _checkpoint=checkpoint, _approval_decisions=decisions,
+        )
+
     def _execute_tool_group(
         self,
         tool_calls: Sequence[LLMToolCall],
@@ -936,6 +1181,90 @@ class AgentToolLoop:
                     model=model,
                 )
             outcomes.append(outcome)
+            if not outcome.success and stop_on_tool_error:
+                break
+        return outcomes
+
+    def _emit_tool_call_requested(
+        self,
+        tool_call: LLMToolCall,
+        step_index: int,
+        requested_execution_mode: ToolExecutionMode,
+        provider: str,
+        model: str,
+    ) -> None:
+        """Emit the safe requested event used before approval preflight."""
+        self._emit("tool_call_requested", "Agent tool loop tool call requested", {
+            "round_index": step_index, "step_index": step_index,
+            "tool_call_id": tool_call.id, "tool_name": tool_call.name,
+            "argument_keys": _argument_keys(tool_call.arguments),
+            "requested_execution_mode": requested_execution_mode,
+            "provider": provider, "model": model,
+        })
+
+    def _execute_approved_tool_group(
+        self,
+        tool_calls: Sequence[LLMToolCall],
+        *,
+        preflight_outcomes: Sequence[_ToolOutcome | None],
+        decisions: Mapping[str, ToolApprovalDecision],
+        allowed_tool_names: frozenset[str],
+        step_index: int,
+        max_steps: int,
+        requested_execution_mode: ToolExecutionMode,
+        effective_execution_mode: ToolExecutionMode,
+        tool_resource_limits: ToolResourceLimits | None,
+        provider: str,
+        model: str,
+        stop_on_tool_error: bool,
+    ) -> list[_ToolOutcome | None]:
+        """Finish a preflighted group without charging resource limits again."""
+        outcomes: list[_ToolOutcome | None] = list(preflight_outcomes)
+        executable: list[tuple[int, LLMToolCall]] = []
+        for index, tool_call in enumerate(tool_calls):
+            if outcomes[index] is not None:
+                continue
+            decision = decisions[tool_call.id]
+            if decision.approved:
+                self._emit("tool_approval_granted", "Tool approval granted", {
+                    "round_index": step_index, "step_index": step_index,
+                    "tool_call_id": tool_call.id, "tool_name": tool_call.name,
+                    "call_index": index, "requested_execution_mode": requested_execution_mode,
+                    "effective_execution_mode": effective_execution_mode,
+                })
+                executable.append((index, tool_call))
+            else:
+                outcome = _approval_denied_tool_outcome(tool_call)
+                self._emit("tool_approval_denied", "Tool approval denied", {
+                    "round_index": step_index, "step_index": step_index,
+                    "tool_call_id": tool_call.id, "tool_name": tool_call.name,
+                    "call_index": index, "requested_execution_mode": requested_execution_mode,
+                    "effective_execution_mode": effective_execution_mode,
+                    "success": False, "error_category": "approval_denied",
+                }, warning=True)
+                outcomes[index] = outcome
+
+        if effective_execution_mode == "parallel":
+            with ThreadPoolExecutor(max_workers=max(1, len(executable))) as executor:
+                futures = [(index, executor.submit(
+                    self._execute_tool_call, call, allowed_tool_names=allowed_tool_names,
+                    step_index=step_index, max_steps=max_steps,
+                    requested_execution_mode=requested_execution_mode,
+                    effective_execution_mode=effective_execution_mode,
+                    tool_resource_limits=tool_resource_limits, provider=provider, model=model,
+                )) for index, call in executable]
+                for index, future in futures:
+                    outcomes[index] = future.result()
+            return outcomes
+
+        for index, tool_call in executable:
+            outcome = self._execute_tool_call(
+                tool_call, allowed_tool_names=allowed_tool_names, step_index=step_index,
+                max_steps=max_steps, requested_execution_mode=requested_execution_mode,
+                effective_execution_mode=effective_execution_mode,
+                tool_resource_limits=tool_resource_limits, provider=provider, model=model,
+            )
+            outcomes[index] = outcome
             if not outcome.success and stop_on_tool_error:
                 break
         return outcomes
@@ -1342,6 +1671,10 @@ class AgentToolLoop:
         final_response: LLMResponse | None = None,
         steps: Sequence[AgentToolLoopStep] = (),
         pending_tool_calls: Sequence[LLMToolCall] = (),
+        pending_approvals: Sequence[PendingToolApproval] = (),
+        checkpoint: AgentToolLoopCheckpoint | None = None,
+        current_round_index: int | None = None,
+        current_step_index: int | None = None,
         tool_results: Sequence[LLMToolResult] = (),
     ) -> AgentToolLoopResult:
         return AgentToolLoopResult(
@@ -1350,6 +1683,10 @@ class AgentToolLoop:
             final_response=final_response,
             steps=tuple(steps) if config.include_intermediate_steps else (),
             pending_tool_calls=tuple(pending_tool_calls),
+            pending_approvals=tuple(pending_approvals),
+            checkpoint=checkpoint,
+            current_round_index=current_round_index,
+            current_step_index=current_step_index,
             tool_results=tuple(tool_results),
         )
 
@@ -1645,6 +1982,22 @@ def _resource_denied_tool_outcome(
         denied=True,
         resource_denied=True,
         limit_name=limit_name,
+    )
+
+
+def _approval_denied_tool_outcome(tool_call: LLMToolCall) -> _ToolOutcome:
+    return _ToolOutcome(
+        llm_result=LLMToolResult(
+            tool_call_id=tool_call.id,
+            name=tool_call.name,
+            content="",
+            success=False,
+            error=f"Tool call denied by approval: {tool_call.name}",
+        ),
+        success=False,
+        error_type="ToolApprovalDeniedError",
+        error_category="approval_denied",
+        denied=True,
     )
 
 
