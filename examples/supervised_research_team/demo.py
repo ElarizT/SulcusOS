@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Sequence
 
 from agentos.llm import LLMRequest, LLMResponse, LLMRuntime, LLMToolCall
+from agentos.config import load_config, resolve_config
 from agentos.runtime import AgentToolLoop, ToolApprovalDecision, ToolResourceLimits
 from agentos.tools import ToolRegistry, ToolRuntime
 from kernel.events import RuntimeEvent, RuntimeEventLog
@@ -148,7 +149,7 @@ class PlannerAgent(Agent):
 class ResearchAgent(Agent):
     role = "ResearchAgent"
 
-    def research(self, topic: str, mode: str, tight_limits: bool) -> tuple[str, int]:
+    def research(self, topic: str, mode: str, tight_limits: bool, configured_limits: ToolResourceLimits | None) -> tuple[str, int]:
         first = _response("", _call("sources", "list_sources"), _call("controlled-failure", "read_source", source_id="missing-source.md"))
         calls = [
             _call("read-supervision", "read_source", source_id="supervision.md"),
@@ -163,7 +164,14 @@ class ResearchAgent(Agent):
 - Recovery: structured tool failures allow a bounded retry against a known source [tool_safety.md].
 - Determinism: concurrent outcomes should be returned in requested-call order [determinism.md].
 - Privacy: runtime metadata can expose tool names and argument keys without argument values [tool_safety.md]."""
-        limits = ToolResourceLimits(max_calls_per_tool={"search_sources": 2}) if tight_limits else None
+        limits = configured_limits
+        if tight_limits:
+            limits = ToolResourceLimits(
+                max_tool_calls_per_loop=None if limits is None else limits.max_tool_calls_per_loop,
+                max_tool_calls_per_round=None if limits is None else limits.max_tool_calls_per_round,
+                max_calls_per_tool={"search_sources": 2},
+                tool_timeout_ms=None if limits is None else limits.tool_timeout_ms,
+            )
         result, _, _ = self.run_script(
             f"Gather local evidence for: {topic}", [first, second, third, _response(findings)],
             tool_names=("list_sources", "read_source", "search_sources", "save_research_note"),
@@ -234,7 +242,7 @@ class ResearchSupervisor(Agent):
         return approved and any(item.name == "publish_report" and item.success for item in resumed.tool_results), len(provider.requests)
 
 
-def run_workflow(topic: str = DEFAULT_TOPIC, execution_mode: str = "sequential", approve_publish: bool = False, tight_limits: bool = False) -> WorkflowResult:
+def run_workflow(topic: str = DEFAULT_TOPIC, execution_mode: str = "sequential", approve_publish: bool = False, tight_limits: bool = False, resource_limits: ToolResourceLimits | None = None) -> WorkflowResult:
     events = RuntimeEventLog()
     local_tools = ResearchTools()
     registry = build_registry(local_tools, events)
@@ -245,7 +253,7 @@ def run_workflow(topic: str = DEFAULT_TOPIC, execution_mode: str = "sequential",
     synthesis = SynthesisAgent(registry, runtime, events)
     supervisor = ResearchSupervisor(registry, runtime, events)
     plan = planner.plan(topic)
-    findings, resource_denials = researcher.research(topic, execution_mode, tight_limits)
+    findings, resource_denials = researcher.research(topic, execution_mode, tight_limits, resource_limits)
     review = critic.review(findings)
     report = synthesis.synthesize(topic, findings, review)
     published, publication_requests = supervisor.publish(report, approve_publish)
@@ -274,7 +282,7 @@ def _print_result(result: WorkflowResult, show_timeline: bool) -> None:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--topic", default=DEFAULT_TOPIC)
-    parser.add_argument("--execution-mode", choices=("sequential", "parallel"), default="sequential")
+    parser.add_argument("--execution-mode", choices=("sequential", "parallel"))
     decision = parser.add_mutually_exclusive_group()
     decision.add_argument("--approve-publish", action="store_true")
     decision.add_argument("--deny-publish", action="store_true")
@@ -285,7 +293,25 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    result = run_workflow(args.topic, args.execution_mode, args.approve_publish and not args.deny_publish, args.tight_limits)
+    effective = resolve_config(load_config(), explicit={"execution_mode": args.execution_mode})
+    configured_limits = ToolResourceLimits(
+        max_tool_calls_per_loop=effective.limits.max_tool_calls_per_loop,
+        max_tool_calls_per_round=effective.limits.max_tool_calls_per_round,
+        tool_timeout_ms=effective.limits.tool_timeout_ms,
+    )
+    if all(value is None for value in (
+        configured_limits.max_tool_calls_per_loop,
+        configured_limits.max_tool_calls_per_round,
+        configured_limits.tool_timeout_ms,
+    )):
+        configured_limits = None
+    result = run_workflow(
+        args.topic,
+        effective.runtime.execution_mode,
+        args.approve_publish and not args.deny_publish,
+        args.tight_limits,
+        configured_limits,
+    )
     _print_result(result, args.show_timeline)
     if not result.controlled_failure_recovered or result.publication_provider_requests != 2:
         raise RuntimeError("workflow safety invariant failed")

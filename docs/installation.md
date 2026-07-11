@@ -25,6 +25,16 @@ sulcus check
 The compatibility command `sulcus-check` prints the same capability report.
 Use `sulcus --help` to list installed diagnostics and offline demos.
 
+Projects may add an optional `sulcus.toml` in their working directory:
+
+```toml
+[sulcus]
+execution_mode = "sequential"
+```
+
+Run `sulcus config check` to validate it. The complete format and precedence
+rules are documented in [configuration.md](configuration.md).
+
 Unix/macOS shells:
 
 ```bash

@@ -28,6 +28,19 @@ Use `sulcus --help` to discover commands, `sulcus --version` for the installed
 version, and `sulcus check` for a Python/native capability report. The existing
 `sulcus-check` command remains available for compatibility.
 
+Optional project defaults can live in `sulcus.toml`:
+
+```toml
+[sulcus]
+execution_mode = "parallel"
+
+[limits]
+max_tool_calls_per_loop = 10
+```
+
+Use `sulcus config check` and `sulcus config show` to validate and inspect the
+effective sanitized settings. See [project configuration](docs/configuration.md).
+
 <p align="center">
   <img src="docs/AgentOS_demo.gif" width="900">
 </p>

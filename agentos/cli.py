@@ -5,8 +5,10 @@ from __future__ import annotations
 from agentos._version import __version__
 import argparse
 from importlib.util import find_spec
+import json
 from typing import Sequence
 
+from agentos.config import ConfigError, discover_config, load_config, resolve_config
 from agentos.native import native_core_available
 
 
@@ -41,6 +43,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=__version__)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("check", help="Report installed runtime capabilities.")
+
+    config = commands.add_parser("config", help="Inspect and validate project configuration.")
+    config_commands = config.add_subparsers(dest="config_command", required=True)
+    config_commands.add_parser("path", help="Print the discovered sulcus.toml path.")
+    config_commands.add_parser("check", help="Validate the discovered configuration.")
+    config_commands.add_parser("show", help="Print effective sanitized configuration.")
 
     demo = commands.add_parser("demo", help="Run a bundled demonstration.")
     demos = demo.add_subparsers(dest="demo_name", required=True)
@@ -84,6 +92,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.command == "check":
         return runtime_check_main()
+    if args.command == "config":
+        path = discover_config()
+        if args.config_command == "path":
+            print(path if path is not None else "No sulcus.toml found in the current directory.")
+            return 0
+        try:
+            effective = resolve_config(load_config(path))
+        except ConfigError as exc:
+            print(f"error: {exc}")
+            return 1
+        if args.config_command == "check":
+            print(f"Valid configuration: {path}" if path is not None else "Valid configuration: defaults (no sulcus.toml found).")
+            return 0
+        print(json.dumps(effective.sanitized(), indent=2, sort_keys=True))
+        return 0
     if args.command == "demo" and args.demo_name == "research-team":
         try:
             from examples.supervised_research_team.demo import main as demo_main
@@ -92,7 +115,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
         try:
             return demo_main(_research_demo_args(args))
-        except (RuntimeError, ValueError) as exc:
+        except (ConfigError, RuntimeError, ValueError) as exc:
             print(f"error: research-team demo failed: {exc}")
             return 1
     return 2
