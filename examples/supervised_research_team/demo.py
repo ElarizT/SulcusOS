@@ -253,9 +253,8 @@ def run_workflow(topic: str = DEFAULT_TOPIC, execution_mode: str = "sequential",
     return WorkflowResult(topic, plan, findings, review, report, approve_publish, published, bool(failures), resource_denials, publication_requests, tuple(e for e in events.events if isinstance(e, RuntimeEvent)), tuple(local_tools.notes))
 
 
-def _print_result(result: WorkflowResult, show_timeline: bool, live: bool) -> None:
-    prefix = "[live] " if live else ""
-    print(f"{prefix}Supervised Research Team")
+def _print_result(result: WorkflowResult, show_timeline: bool) -> None:
+    print("Supervised Research Team")
     print("\nPLAN\n" + result.plan)
     print("\nFINDINGS\n" + result.findings)
     print("\nCRITIC REVIEW\n" + result.critic_review)
@@ -281,14 +280,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     decision.add_argument("--deny-publish", action="store_true")
     parser.add_argument("--tight-limits", action="store_true")
     parser.add_argument("--show-timeline", action="store_true")
-    parser.add_argument("--live", action="store_true", help="Show lightweight progress-style terminal labels; still offline.")
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     result = run_workflow(args.topic, args.execution_mode, args.approve_publish and not args.deny_publish, args.tight_limits)
-    _print_result(result, args.show_timeline, args.live)
+    _print_result(result, args.show_timeline)
     if not result.controlled_failure_recovered or result.publication_provider_requests != 2:
         raise RuntimeError("workflow safety invariant failed")
     if args.tight_limits and result.resource_denials != 1:

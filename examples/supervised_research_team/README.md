@@ -45,13 +45,10 @@ python -m examples.supervised_research_team.demo --tight-limits
 python -m examples.supervised_research_team.demo --show-timeline
 python -m examples.supervised_research_team.demo --approve-publish
 python -m examples.supervised_research_team.demo --deny-publish
-python -m examples.supervised_research_team.demo --live
 ```
 
 Sequential and parallel modes use the same requested-call ordering. The
 timeline renders only safe runtime metadata such as tool names, counts, modes,
-and argument keys—not prompts or raw argument values. `--live` adds a simple
-progress-style label but deliberately stays on the same offline scripted
-provider. It is intended as a live terminal presentation, not a network-backed
-research mode.
-
+and argument keys—not prompts or raw argument values. The demo intentionally
+does not advertise a live mode: it is an offline runtime demonstration, not a
+provider-backed research service.

@@ -38,9 +38,9 @@ def test_manifest_and_package_discovery_exclude_development_junk() -> None:
     manifest = (ROOT / "MANIFEST.in").read_text(encoding="utf-8")
     assert "recursive-include agentos *.py" in manifest
     assert "recursive-include kernel *.py" in manifest
+    assert "recursive-include examples/supervised_research_team *.py *.md" in manifest
     assert "global-exclude *.log" in manifest
     assert "prune tests" in manifest
-    assert "prune examples" in manifest
 
 
 def test_core_public_imports_remain_python_only() -> None:

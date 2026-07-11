@@ -2,6 +2,7 @@ include README.md
 include pyproject.toml
 recursive-include agentos *.py
 recursive-include kernel *.py
+recursive-include examples/supervised_research_team *.py *.md
 global-exclude *.py[cod]
 global-exclude *.log
 prune .venv
@@ -9,5 +10,4 @@ prune dist
 prune build
 prune target
 prune tests
-prune examples
 prune docs

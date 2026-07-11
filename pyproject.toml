@@ -45,11 +45,15 @@ dev = [
 ]
 
 [project.scripts]
+sulcus = "agentos.cli:main"
 sulcus-check = "agentos.cli:runtime_check_main"
 
 [tool.setuptools.dynamic]
 version = {attr = "agentos._version.__version__"}
 
 [tool.setuptools.packages.find]
-include = ["agentos*", "kernel*"]
-exclude = ["tests*", "examples*", "docs*", "demos*"]
+include = ["agentos*", "kernel*", "examples.supervised_research_team*"]
+exclude = ["tests*", "docs*", "demos*"]
+
+[tool.setuptools.package-data]
+"examples.supervised_research_team" = ["sources/*.md"]

@@ -12,11 +12,21 @@ Rust, or native core:
 python -m examples.supervised_research_team.demo
 ```
 
+After installation, the shorter command is:
+
+```powershell
+sulcus demo research-team
+```
+
 It plans a topic, researches bundled sources through registered tools, recovers
 from a controlled failure, asks a critic to review the evidence, and pauses at
 an approval checkpoint before simulated publication. Publication is denied by
 default. See [the demo guide](examples/supervised_research_team/README.md) for
 parallel execution, tight resource limits, approval, and safe timeline options.
+
+Use `sulcus --help` to discover commands, `sulcus --version` for the installed
+version, and `sulcus check` for a Python/native capability report. The existing
+`sulcus-check` command remains available for compatibility.
 
 <p align="center">
   <img src="docs/AgentOS_demo.gif" width="900">
@@ -170,8 +180,9 @@ cargo build
 python main.py
 ```
 
-Run `sulcus-check` after installation for a concise Python/native capability
-report. See `docs/installation.md` for editable installs, extras, wheel builds,
+Run `sulcus check` after installation for a concise Python/native capability
+report (`sulcus-check` remains a compatibility alias). See
+`docs/installation.md` for editable installs, extras, wheel builds,
 and clean-environment testing.
 
 ### Native Core and Python-Only Mode

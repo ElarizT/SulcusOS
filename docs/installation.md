@@ -19,8 +19,11 @@ py -m venv .venv
 python -m pip install -U pip
 pip install -e .
 python examples\public_api_quickstart.py
-sulcus-check
+sulcus check
 ```
+
+The compatibility command `sulcus-check` prints the same capability report.
+Use `sulcus --help` to list installed diagnostics and offline demos.
 
 Unix/macOS shells:
 
@@ -30,7 +33,7 @@ python3 -m venv .venv
 python -m pip install -U pip
 pip install -e .
 python examples/public_api_quickstart.py
-sulcus-check
+sulcus check
 ```
 
 This supports the public LLM, tools, timeline, and agent tool-loop APIs without
@@ -67,7 +70,7 @@ file with `pip install dist\sulcus_os-<version>-py3-none-any.whl`.
 
 ## Troubleshooting
 
-- `Native core: unavailable` from `sulcus-check` is expected for Python-only
+- `Native core: unavailable` from `sulcus check` (or `sulcus-check`) is expected for Python-only
   installs. Run `maturin develop` only for native features.
 - If an OpenAI-compatible provider says its SDK is missing, install
   `.[openai]` and retry.
