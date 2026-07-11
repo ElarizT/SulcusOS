@@ -3,6 +3,21 @@
 
 An experimental runtime for hierarchical multi-agent systems featuring supervision, IPC, memory paging, fault tolerance, and an interactive dashboard.
 
+## Try the Flagship Demo
+
+Run the polished **Supervised Research Team** with no API key, network access,
+Rust, or native core:
+
+```powershell
+python -m examples.supervised_research_team.demo
+```
+
+It plans a topic, researches bundled sources through registered tools, recovers
+from a controlled failure, asks a critic to review the evidence, and pauses at
+an approval checkpoint before simulated publication. Publication is denied by
+default. See [the demo guide](examples/supervised_research_team/README.md) for
+parallel execution, tight resource limits, approval, and safe timeline options.
+
 <p align="center">
   <img src="docs/AgentOS_demo.gif" width="900">
 </p>
