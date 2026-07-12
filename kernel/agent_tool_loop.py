@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -176,6 +177,11 @@ class AgentToolLoopCheckpoint:
     tool_requested: tuple[tuple[str, int], ...]
     provider: str
     model: str
+    # Persistence provenance is data-only.  It is absent from ordinary
+    # in-memory checkpoints and lets a compatible, newly constructed loop
+    # accept a checkpoint reconstructed from the versioned disk schema.
+    persistent: bool = False
+    created_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -775,6 +781,7 @@ class AgentToolLoop:
                         unsafe_tool_count=resolved_mode.unsafe_tool_count,
                         total_requested=total_requested, round_requested=round_requested,
                         tool_requested=tool_requested, provider=response.provider, model=response.model,
+                        created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                     )
                     steps.append(paused_step)
                     for approval in pending:
@@ -1047,7 +1054,7 @@ class AgentToolLoop:
             raise TypeError("checkpoint must be an AgentToolLoopCheckpoint")
         if checkpoint.checkpoint_version != 1:
             raise ValueError("unsupported checkpoint_version")
-        if checkpoint.loop_id != self._loop_id:
+        if checkpoint.loop_id != self._loop_id and not checkpoint.persistent:
             raise ValueError("checkpoint belongs to a different AgentToolLoop instance")
         if checkpoint.checkpoint_id in self._consumed_checkpoints:
             raise ValueError("checkpoint has already been consumed")

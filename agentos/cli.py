@@ -5,11 +5,14 @@ from __future__ import annotations
 from agentos._version import __version__
 import argparse
 from importlib.util import find_spec
+from importlib import import_module
 import json
 from typing import Sequence
 
 from agentos.config import ConfigError, discover_config, load_config, resolve_config
 from agentos.native import native_core_available
+from agentos.checkpoints import CheckpointError, inspect_checkpoint, resume_checkpoint
+from agentos.runtime import AgentToolLoop, ToolApprovalDecision
 
 
 def _module_available(name: str) -> bool:
@@ -49,6 +52,16 @@ def _build_parser() -> argparse.ArgumentParser:
     config_commands.add_parser("path", help="Print the discovered sulcus.toml path.")
     config_commands.add_parser("check", help="Validate the discovered configuration.")
     config_commands.add_parser("show", help="Print effective sanitized configuration.")
+
+    checkpoint = commands.add_parser("checkpoint", help="Inspect or resume a persisted approval checkpoint.")
+    checkpoint_commands = checkpoint.add_subparsers(dest="checkpoint_command", required=True)
+    checkpoint_inspect = checkpoint_commands.add_parser("inspect", help="Print sanitized checkpoint metadata.")
+    checkpoint_inspect.add_argument("path")
+    checkpoint_resume = checkpoint_commands.add_parser("resume", help="Resume using a caller-supplied AgentToolLoop factory.")
+    checkpoint_resume.add_argument("path")
+    checkpoint_resume.add_argument("--approve", action="append", default=[], metavar="TOOL_CALL_ID")
+    checkpoint_resume.add_argument("--deny", action="append", default=[], metavar="TOOL_CALL_ID")
+    checkpoint_resume.add_argument("--runtime-factory", required=True, metavar="MODULE:CALLABLE", help="Zero-argument factory returning the current AgentToolLoop.")
 
     demo = commands.add_parser("demo", help="Run a bundled demonstration.")
     demos = demo.add_subparsers(dest="demo_name", required=True)
@@ -107,6 +120,53 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         print(json.dumps(effective.sanitized(), indent=2, sort_keys=True))
         return 0
+    if args.command == "checkpoint":
+        try:
+            if args.checkpoint_command == "inspect":
+                metadata = inspect_checkpoint(args.path)
+                print(json.dumps({
+                    "schema_version": metadata.schema_version,
+                    "checkpoint_id": metadata.checkpoint_id,
+                    "created_at": metadata.created_at,
+                    "status": metadata.status,
+                    "round_index": metadata.round_index,
+                    "provider": metadata.provider,
+                    "model": metadata.model,
+                    "execution_mode": metadata.execution_mode,
+                    "required_tools": metadata.required_tools,
+                    "pending_approvals": [
+                        {"tool_call_id": item.tool_call_id, "tool_name": item.tool_name,
+                         "round_index": item.round_index, "call_index": item.call_index}
+                        for item in metadata.pending_approvals
+                    ],
+                    "tool_schema_fingerprints": dict(metadata.tool_schema_fingerprints),
+                }, indent=2, sort_keys=True))
+                return 0
+            overlap = set(args.approve) & set(args.deny)
+            if overlap:
+                raise CheckpointError(f"conflicting decisions for tool call: {sorted(overlap)[0]}")
+            module_name, separator, attribute = args.runtime_factory.partition(":")
+            if not separator or not module_name or not attribute:
+                raise CheckpointError("runtime factory must use MODULE:CALLABLE syntax")
+            factory = getattr(import_module(module_name), attribute, None)
+            if not callable(factory):
+                raise CheckpointError("runtime factory is not callable")
+            loop = factory()
+            if not isinstance(loop, AgentToolLoop):
+                raise CheckpointError("runtime factory did not return an AgentToolLoop")
+            decisions = [*(ToolApprovalDecision(item, True) for item in args.approve),
+                         *(ToolApprovalDecision(item, False) for item in args.deny)]
+            result = resume_checkpoint(loop, args.path, decisions)
+            if result.reason == "approval_required":
+                print(f"Checkpoint preserved: {len(result.pending_approvals)} approval decision(s) required.")
+                return 3
+            print(f"Checkpoint consumed: {result.reason}.")
+            if result.final_response is not None:
+                print(result.final_response.content)
+            return 0 if result.completed else 1
+        except (CheckpointError, ImportError, AttributeError, TypeError, ValueError) as exc:
+            print(f"error: {exc}")
+            return 1
     if args.command == "demo" and args.demo_name == "research-team":
         try:
             from examples.supervised_research_team.demo import main as demo_main

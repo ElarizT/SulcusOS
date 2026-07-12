@@ -95,6 +95,7 @@ Process Registry, workflow or recovery status, and WASM isolation status.
 - `docs/supervision.md` covers supervisor trees and restart policies.
 - `docs/persistent_memory.md` covers tiered persistent memory paging.
 - `docs/public_api.md` lists the supported Python API and migration guidance.
+- `docs/checkpoints.md` covers restart-safe approval checkpoint persistence.
 
 ## Public Python API
 
@@ -900,10 +901,31 @@ submitted; the existing sequential fallback and original call-result order are
 preserved. Approval lifecycle events are `tool_approval_requested`,
 `agent_tool_loop_paused`, `tool_approval_granted`, `tool_approval_denied`, and
 `agent_tool_loop_resumed`; their metadata excludes argument values and approval
-comments. Checkpoints are in-memory only in this release.
+comments.
+
+Persist a pause and resume it against a newly constructed compatible loop:
+
+```python
+from agentos.checkpoints import save_checkpoint, resume_checkpoint
+from agentos.runtime import ToolApprovalDecision
+
+save_checkpoint(paused.checkpoint, "approval.checkpoint.json")
+result = resume_checkpoint(
+    new_loop, "approval.checkpoint.json",
+    [ToolApprovalDecision("call-1", approved=True)],
+)
+```
+
+The version-1 JSON uses stable tool names and schema fingerprints and does not
+serialize runtimes, providers, callables, exceptions, or approval comments.
+Complete decisions move the source to `.consumed`; partial decisions preserve
+it. Files contain conversation content and tool arguments, so protect them as
+sensitive data. See [persistent checkpoints](docs/checkpoints.md) for schema,
+CLI, compatibility, privacy, staleness, and limitations.
 
 Run the offline demo:
 
 ```powershell
 python examples/agent_tool_loop_approval_resume_demo.py
+python -m examples.agent_tool_loop_persistent_checkpoint_demo
 ```
