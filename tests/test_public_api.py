@@ -58,7 +58,7 @@ EXPECTED_TOP_LEVEL_API = {
 def test_top_level_api_snapshot_is_intentional() -> None:
     assert set(agentos.__all__) == EXPECTED_TOP_LEVEL_API
     assert all(isinstance(name, str) and hasattr(agentos, name) for name in agentos.__all__)
-    assert agentos.__version__ == "0.9.13"
+    assert agentos.__version__ == "0.9.16"
     assert not hasattr(agentos, "LLMRuntime")
     assert not hasattr(agentos, "agent_os_core")
 
@@ -91,7 +91,7 @@ def test_public_import_is_lightweight_in_a_fresh_process() -> None:
             "-c",
             "import sys; import agentos; "
             "assert 'main' not in sys.modules; "
-            "assert agentos.__version__ == '0.9.13'; print('ok')",
+            "assert agentos.__version__ == '0.9.16'; print('ok')",
         ],
         cwd=Path(__file__).resolve().parents[1],
         text=True,

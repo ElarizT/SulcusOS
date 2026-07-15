@@ -7,7 +7,7 @@ import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from agentos.llm import LLMResponse, LLMRuntime, LLMToolCall, LLMToolDefinition
+from agentos.llm import LLMResponse, LLMRuntime, LLMToolCall
 from agentos.runtime import AgentToolLoop
 from agentos.tools import ToolRegistry, ToolRuntime
 
@@ -45,7 +45,7 @@ def main() -> int:
     )
     result = loop.run(
         [{"role": "user", "content": "What is 20 plus 22?"}],
-        [LLMToolDefinition("add_numbers", "Add two numbers.", {"type": "object"})],
+        registry.llm_tool_definitions(),
     )
     assert result.completed and result.final_response is not None
     print(result.final_response.content)

@@ -80,9 +80,6 @@ file with `pip install dist\sulcus_os-<version>-py3-none-any.whl`.
 
 ## Troubleshooting
 
-- `Native core: unavailable` from `sulcus check` (or `sulcus-check`) is expected for Python-only
-  installs. Run `maturin develop` only for native features.
-- If an OpenAI-compatible provider says its SDK is missing, install
-  `.[openai]` and retry.
-- To reset a local environment, deactivate it, remove `.venv`, recreate it,
-  then repeat the editable-install commands.
+See the dedicated [troubleshooting guide](troubleshooting.md) for native-core,
+Maturin, optional OpenAI SDK, configuration, checkpoint, CLI, and editable
+install failures.

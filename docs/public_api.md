@@ -1,7 +1,7 @@
 # Public Python API
 
 Sulcus OS currently uses `agentos` as its Python import package for backward
-compatibility. Step 45 establishes the intended pre-v1 public surface.
+compatibility. The following is the intended pre-v1 public surface.
 
 ## Stability levels
 
@@ -11,6 +11,9 @@ compatibility. Step 45 establishes the intended pre-v1 public surface.
   integrations; its wider provider configuration may evolve with notice.
 - **Internal:** `kernel.*` implements Sulcus OS. Existing imports remain
   supported for compatibility, but new applications should use `agentos.*`.
+
+All levels remain pre-v1. "Stable" describes the intended v1-facing boundary,
+not a permanent compatibility guarantee before version 1.0.
 
 ## Top-level `agentos`
 
