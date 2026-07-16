@@ -20,7 +20,7 @@ from kernel.metrics import build_agent_metrics_snapshot, render_agent_metrics
 from kernel.replay import build_replay_session, render_replay_session
 from kernel.timeline import render_runtime_timeline
 
-SHELL_PROMPT = "AgentOS>"
+SHELL_PROMPT = "Sulcus>"
 
 
 @dataclass
@@ -40,7 +40,10 @@ class WasmRunMetric:
 
 
 class AgentOSDashboard(App[None]):
-    """Real-time terminal dashboard for Agent OS kernel telemetry."""
+    """Real-time terminal dashboard for Sulcus OS kernel telemetry."""
+
+    TITLE = "Sulcus OS"
+    SUB_TITLE = "Runtime Dashboard"
 
     CSS = """
     Screen {
@@ -50,7 +53,7 @@ class AgentOSDashboard(App[None]):
 
     #status-bar {
         height: 3;
-        padding: 0 1;
+        padding: 0 2;
         content-align: left middle;
         background: #101722;
         border-bottom: solid #263245;
@@ -58,31 +61,30 @@ class AgentOSDashboard(App[None]):
 
     #main-grid {
         layout: grid;
-        grid-size: 2 3;
-        grid-columns: 1fr 1fr;
-        grid-rows: 1fr 4fr 3fr;
+        grid-size: 2 2;
+        grid-columns: 2fr 3fr;
+        grid-rows: 4fr 5fr;
         height: 1fr;
     }
 
     .pane {
         border: solid #263245;
         padding: 0 1;
-        min-height: 8;
+        min-height: 7;
     }
 
-    #ipc-pane {
-        column-span: 1;
-        row-span: 1;
+    .primary-title {
+        background: #101722;
+        color: #c9eeff;
+        padding: 0 1;
     }
 
-    #memory-pane {
-        column-span: 1;
-        row-span: 1;
+    .secondary-title {
+        color: #7086a6;
     }
 
-    #wasm-pane {
-        column-span: 2;
-        row-span: 1;
+    .optional-monitor {
+        display: none;
     }
 
     #process-pane {
@@ -114,23 +116,24 @@ class AgentOSDashboard(App[None]):
     }
 
     #ipc-table {
-        height: 1fr;
+        height: 3;
+        min-height: 3;
     }
 
     #memory-bars {
-        height: 1fr;
-        padding-top: 1;
+        height: 3;
         overflow: auto;
     }
 
     #wasm-log {
         height: 1fr;
+        min-height: 5;
         background: #080b0f;
         overflow: auto;
     }
 
     #llm-stream-monitor {
-        height: 2;
+        height: 3;
         overflow: auto;
     }
 
@@ -155,28 +158,31 @@ class AgentOSDashboard(App[None]):
     }
 
     #runtime-timeline {
-        height: 1fr;
+        height: 2fr;
+        min-height: 4;
         overflow: auto;
     }
 
     #agent-metrics {
-        height: 1fr;
+        height: 3;
         overflow: auto;
     }
 
     #ipc-inspector {
-        height: 1fr;
+        height: 3;
         overflow: auto;
     }
 
     #execution-replay {
         height: 1fr;
+        min-height: 3;
         overflow: auto;
     }
 
     #shell-input {
         dock: bottom;
         height: 3;
+        padding: 0 1;
         border-top: solid #263245;
         background: #101722;
     }
@@ -326,35 +332,70 @@ class AgentOSDashboard(App[None]):
         yield Header(show_clock=True)
         yield Static(id="status-bar")
         with Container(id="main-grid"):
-            with Vertical(id="ipc-pane", classes="pane"):
-                yield Static("IPC Mailbox Lane Monitor", classes="pane-title")
-                yield DataTable(id="ipc-table")
-                yield Static("Agent Metrics", id="metrics-title", classes="pane-title")
-                yield Static(id="agent-metrics")
-            with Vertical(id="memory-pane", classes="pane"):
-                yield Static("Page Table Context Visualizer", classes="pane-title")
-                yield Static(id="memory-bars")
-                yield Static("IPC Inspector", id="ipc-inspector-title", classes="pane-title")
-                yield Static(id="ipc-inspector")
-            with Vertical(id="wasm-pane", classes="pane"):
-                yield Static("Execution / WASM Isolation Monitor", classes="pane-title")
-                yield RichLog(id="wasm-log", markup=True, wrap=True, highlight=True, auto_scroll=False)
-                yield Static("LLM Stream Monitor", id="llm-stream-title")
-                yield Static(id="llm-stream-monitor")
-                yield Static("LLM Cost Monitor", id="llm-cost-title")
-                yield Static(id="llm-cost-monitor")
             with Vertical(id="agent-tree-pane", classes="pane"):
-                yield Static("Agent Tree View", classes="pane-title")
+                yield Static("Agent Tree", classes="pane-title primary-title")
                 yield Static(id="agent-tree")
-                yield Static("Agent Dependency Graph", id="dependency-graph-title", classes="pane-title")
-                yield Static(id="dependency-graph")
-            with Vertical(id="process-pane", classes="pane"):
-                yield Static("Process Registry", classes="pane-title")
-                yield DataTable(id="process-table")
-                yield Static("Runtime Timeline", id="timeline-title", classes="pane-title")
+                yield Static(
+                    "Agent Dependency Graph",
+                    id="dependency-graph-title",
+                    classes="pane-title secondary-title optional-monitor",
+                )
+                yield Static(id="dependency-graph", classes="optional-monitor")
+            with Vertical(id="timeline-pane", classes="pane"):
+                yield Static(
+                    "Runtime Timeline", id="timeline-title", classes="pane-title primary-title"
+                )
                 yield Static(id="runtime-timeline")
-                yield Static("Execution Replay", id="replay-title", classes="pane-title")
-                yield Static(id="execution-replay")
+                yield Static(
+                    "Execution Replay",
+                    id="replay-title",
+                    classes="pane-title secondary-title optional-monitor",
+                )
+                yield Static(id="execution-replay", classes="optional-monitor")
+            with Vertical(id="process-pane", classes="pane"):
+                yield Static("Process Registry", classes="pane-title primary-title")
+                yield DataTable(id="process-table")
+                yield Static(
+                    "[dim]No processes registered. Use the command bar to launch an agent.[/]",
+                    id="process-empty",
+                )
+                yield Static(
+                    "Agent Metrics",
+                    id="metrics-title",
+                    classes="pane-title secondary-title optional-monitor",
+                )
+                yield Static(id="agent-metrics", classes="optional-monitor")
+                yield Static(
+                    "IPC Queues", id="ipc-title", classes="pane-title secondary-title optional-monitor"
+                )
+                yield DataTable(id="ipc-table", classes="optional-monitor")
+                yield Static(
+                    "IPC Inspector",
+                    id="ipc-inspector-title",
+                    classes="pane-title secondary-title optional-monitor",
+                )
+                yield Static(id="ipc-inspector", classes="optional-monitor")
+            with Vertical(id="wasm-pane", classes="pane"):
+                yield Static("Tool / LLM Activity", classes="pane-title primary-title")
+                yield RichLog(id="wasm-log", markup=True, wrap=True, highlight=True, auto_scroll=False)
+                yield Static(
+                    "LLM Stream Monitor",
+                    id="llm-stream-title",
+                    classes="pane-title secondary-title optional-monitor",
+                )
+                yield Static(id="llm-stream-monitor", classes="optional-monitor")
+                yield Static(
+                    "LLM Cost Monitor",
+                    id="llm-cost-title",
+                    classes="pane-title secondary-title optional-monitor",
+                )
+                yield Static(id="llm-cost-monitor", classes="optional-monitor")
+                yield Static(
+                    "Memory Context",
+                    id="memory-title",
+                    classes="pane-title secondary-title optional-monitor",
+                )
+                yield Static(id="memory-bars", classes="optional-monitor")
         yield Input(
             placeholder=f"{SHELL_PROMPT} run <path> | inspect <path> | demos | ps | kill <PID>",
             id="shell-input",
@@ -368,7 +409,7 @@ class AgentOSDashboard(App[None]):
         process_table = self.query_one("#process-table", DataTable)
         process_table.cursor_type = "row"
         process_table.add_columns(
-            "PID", "Name", "Status", "Mode", "Parent", "Kids", "Restarts", "Strategy", "Memory", "IPC"
+            "PID", "Agent", "State", "Mode", "Supervision", "Memory", "IPC"
         )
         self.set_interval(0.1, self.refresh_metrics)
 
@@ -440,20 +481,69 @@ class AgentOSDashboard(App[None]):
         self._heartbeat_index = (self._heartbeat_index + 1) % len(heartbeats)
         heartbeat = heartbeats[self._heartbeat_index]
 
+        process_rows = (
+            self._demo_process_rows
+            if self._demo_process_rows is not None
+            else self._process_rows
+        )
+        observed_agents = max(len(process_rows), len(mailboxes))
         total_agents = (
             len(self._demo_process_rows)
             if self._demo_process_rows is not None
-            else self._safe_call(self.kernel, "total_registered_agents", default=len(mailboxes))
+            else max(
+                int(
+                    self._safe_call(
+                        self.kernel, "total_registered_agents", default=observed_agents
+                    )
+                ),
+                observed_agents,
+            )
         )
         active_tokens = self._safe_call(self.memory, "get_global_active_token_count", default=0)
 
-        self.query_one("#status-bar", Static).update(
-            f"[bold #8bd5ff]Agent OS[/]  "
-            f"Agents: [bold]{total_agents}[/]  "
-            f"Active Tokens: [bold]{active_tokens}[/]  "
-            f"Health: [bold #8cffb5]{heartbeat} ONLINE[/]  "
-            f"{'[bold #8cffb5]' + self._demo_status + '[/]' if self._demo_status else ''}"
+        active_agents = sum(
+            str(row.get("status", "")).lower() in {"running", "starting"}
+            for row in process_rows
         )
+        failed_agents = sum(
+            str(row.get("status", "")).lower() in {"crashed", "failed"}
+            for row in process_rows
+        )
+        restarted_agents = sum(int(row.get("restart_count", 0) or 0) > 0 for row in process_rows)
+        tool_calls = self._tool_call_count(self._observable_events())
+        if failed_agents or (self._demo_status and "failed" in self._demo_status.lower()):
+            health = "DEGRADED"
+            health_style = "bold #ff6b6b"
+        elif restarted_agents:
+            health = "RECOVERED"
+            health_style = "bold #ffd166"
+        else:
+            health = "ONLINE"
+            health_style = "bold #8cffb5"
+
+        self.query_one("#status-bar", Static).update(
+            f"[bold #8bd5ff]SULCUS OS[/]  "
+            f"[dim]HEALTH[/] [{health_style}]{heartbeat} {health}[/]  [#3b4b62]|[/]  "
+            f"[dim]AGENTS[/] [bold]{active_agents}/{total_agents} active[/]  "
+            f"[dim]TOOL CALLS[/] [bold]{tool_calls}[/]  "
+            f"[dim]TOKENS[/] [bold]{active_tokens} active[/]"
+            f"{'  [#3b4b62]|[/]  [bold #c9eeff]' + self._demo_status + '[/]' if self._demo_status else ''}"
+        )
+
+    @staticmethod
+    def _tool_call_count(events: list[Any]) -> int:
+        call_ids: set[str] = set()
+        anonymous = 0
+        request_types = {"tool.execution_requested", "tool_call_requested"}
+        for event in events:
+            if not isinstance(event, RuntimeEvent) or event.event_type not in request_types:
+                continue
+            call_id = event.metadata.get("tool_call_id")
+            if isinstance(call_id, str) and call_id:
+                call_ids.add(call_id)
+            else:
+                anonymous += 1
+        return len(call_ids) + anonymous
 
     def _render_mailboxes(self, mailboxes: list[MailboxMetric]) -> None:
         signature = tuple(
@@ -463,6 +553,7 @@ class AgentOSDashboard(App[None]):
         if signature == self._mailbox_signature:
             return
         self._mailbox_signature = signature
+        self._set_optional_monitor("#ipc-title", "#ipc-table", visible=bool(mailboxes))
         table = self.query_one("#ipc-table", DataTable)
         with self._preserve_scroll(table):
             table.clear()
@@ -480,12 +571,14 @@ class AgentOSDashboard(App[None]):
 
     def _render_memory(self, agents: list[str]) -> None:
         if self._demo_page_tables is not None:
+            self._set_optional_monitor("#memory-title", "#memory-bars", visible=True)
             self._update_scrollable_static(
                 "#memory-bars",
                 self._format_demo_page_tables(self._demo_page_tables),
             )
             return
 
+        self._set_optional_monitor("#memory-title", "#memory-bars", visible=bool(agents))
         lines: list[str] = []
 
         if not agents:
@@ -553,6 +646,7 @@ class AgentOSDashboard(App[None]):
             events = self.supervision_event_snapshot()
         else:
             return
+
         for event in events[self._logged_supervision_events :]:
             if isinstance(event, RuntimeEvent):
                 self._write_execution_log(event, scroll_end=False)
@@ -594,6 +688,7 @@ class AgentOSDashboard(App[None]):
         if signature == self._replay_signature:
             return
         self._replay_signature = signature
+        self._set_optional_monitor("#replay-title", "#execution-replay", visible=bool(rows))
         content = "\n".join(rows) if rows else "[dim]No replay data available.[/]"
         self._update_scrollable_static_follow_end("#execution-replay", content)
 
@@ -604,6 +699,9 @@ class AgentOSDashboard(App[None]):
         if signature == self._llm_stream_signature:
             return
         self._llm_stream_signature = signature
+        self._set_optional_monitor(
+            "#llm-stream-title", "#llm-stream-monitor", visible=bool(snapshot.metrics)
+        )
         self._update_scrollable_static_follow_end("#llm-stream-monitor", "\n".join(rows))
 
     def _render_llm_cost_monitor(self) -> None:
@@ -613,6 +711,11 @@ class AgentOSDashboard(App[None]):
         if signature == self._llm_cost_signature:
             return
         self._llm_cost_signature = signature
+        self._set_optional_monitor(
+            "#llm-cost-title",
+            "#llm-cost-monitor",
+            visible=bool(snapshot.ledger.records),
+        )
         self._update_scrollable_static_follow_end("#llm-cost-monitor", "\n".join(rows))
 
     def _observable_events(self) -> list[Any]:
@@ -635,6 +738,7 @@ class AgentOSDashboard(App[None]):
         if signature == self._metrics_signature:
             return
         self._metrics_signature = signature
+        self._set_optional_monitor("#metrics-title", "#agent-metrics", visible=bool(rows))
         content = "\n".join(rows) if rows else "[dim]No agent metrics available yet.[/]"
         self._update_scrollable_static_follow_end("#agent-metrics", content)
 
@@ -649,6 +753,9 @@ class AgentOSDashboard(App[None]):
         if signature == self._ipc_inspector_signature:
             return
         self._ipc_inspector_signature = signature
+        self._set_optional_monitor(
+            "#ipc-inspector-title", "#ipc-inspector", visible=bool(rows)
+        )
         content = "\n".join(rows) if rows else "[dim]No IPC activity yet.[/]"
         self._update_scrollable_static_follow_end("#ipc-inspector", content)
 
@@ -663,6 +770,11 @@ class AgentOSDashboard(App[None]):
         if signature == self._dependency_graph_signature:
             return
         self._dependency_graph_signature = signature
+        self._set_optional_monitor(
+            "#dependency-graph-title",
+            "#dependency-graph",
+            visible=True,
+        )
         self._update_scrollable_static_follow_end("#dependency-graph", "\n".join(rows))
 
     def _ipc_records(self) -> list[Any]:
@@ -699,39 +811,62 @@ class AgentOSDashboard(App[None]):
             return
         self._process_signature = signature
         table = self.query_one("#process-table", DataTable)
+        table.display = bool(rows)
+        self.query_one("#process-empty", Static).display = not rows
         with self._preserve_scroll(table):
             table.clear()
             for row in rows:
                 status = str(row.get("status", "unknown"))
+                restart_count = int(row.get("restart_count", 0) or 0)
+                display_status = self._display_process_status(
+                    status, external=bool(row.get("external"))
+                )
+                if status == "running" and restart_count:
+                    display_status = "RESTARTED"
                 status_style = {
-                    "running": "green",
-                    "starting": "yellow",
-                    "stopping": "yellow",
-                    "killed": "dim",
-                    "crashed": "bold red",
-                    "exited": "dim",
-                }.get(status, "white")
-                display_status = self._display_process_status(status, external=bool(row.get("external")))
+                    "RUNNING": "bold #8cffb5",
+                    "RESTARTED": "bold #8bd5ff",
+                    "STARTING": "bold #ffd166",
+                    "STOPPING": "#ffd166",
+                    "TERMINATED": "dim #ff8a8a",
+                    "CRASHED": "bold #ff6b6b",
+                    "FAILED": "bold #ff6b6b",
+                    "COMPLETED": "#8cffb5",
+                    "EXITED": "dim",
+                }.get(display_status, "white")
                 depth = int(row.get("tree_depth", 0))
-                display_name = f"{'  ' * depth}{row.get('name', '')}"
+                display_name = f"{'|  ' * depth}{row.get('name', '')}"
                 table.add_row(
                     str(row.get("pid", "")),
                     display_name,
                     Text(display_status, style=status_style),
                     str(row.get("execution_mode", "")),
-                    "" if row.get("supervisor_pid") is None else str(row.get("supervisor_pid")),
-                    str(row.get("child_count", 0)),
-                    str(row.get("restart_count", 0)),
-                    str(row.get("supervisor_strategy", "")),
+                    self._format_supervision(row),
                     f"{row.get('memory_hot_tokens', row.get('memory_tokens', 0))}/{row.get('memory_paged_count', 0)}",
                     f"{row.get('messages_sent', 0)}/{row.get('messages_received', 0)}/{row.get('message_errors', 0)}",
                 )
 
     @staticmethod
+    def _format_supervision(row: dict[str, Any]) -> str:
+        parts: list[str] = []
+        if row.get("supervisor_pid") is not None:
+            parts.append(f"parent={row['supervisor_pid']}")
+        child_count = int(row.get("child_count", 0) or 0)
+        if child_count:
+            parts.append(f"children={child_count}")
+        restart_count = int(row.get("restart_count", 0) or 0)
+        if restart_count:
+            parts.append(f"restarts={restart_count}")
+        strategy = str(row.get("supervisor_strategy", "")).strip()
+        if strategy:
+            parts.append(strategy)
+        return "  ".join(parts) or "-"
+
+    @staticmethod
     def _display_process_status(status: str, *, external: bool = False) -> str:
         if external and status == "exited":
             return "COMPLETED"
-        return "TERMINATED" if status == "killed" else status
+        return "TERMINATED" if status == "killed" else status.upper()
 
     def _render_agent_tree(self) -> None:
         hierarchy = self._demo_hierarchy or self._hierarchy_from_process_rows(self._process_rows)
@@ -744,6 +879,13 @@ class AgentOSDashboard(App[None]):
         widget = self.query_one(selector, Static)
         with self._preserve_scroll(widget):
             widget.update(content)
+
+    def _set_optional_monitor(
+        self, title_selector: str, content_selector: str, *, visible: bool
+    ) -> None:
+        """Show secondary telemetry only when it contributes useful information."""
+        self.query_one(title_selector).display = visible
+        self.query_one(content_selector).display = visible
 
     def _update_scrollable_static_follow_end(self, selector: str, content: str) -> None:
         if self._scrollable_content.get(selector) == content:
@@ -797,6 +939,8 @@ class AgentOSDashboard(App[None]):
         for name, row in children_by_name.items():
             if row.get("status") == "killed":
                 suffix = " (terminated)"
+            elif row.get("status") in {"crashed", "failed"}:
+                suffix = " (failed)"
             elif int(row.get("restart_count", 0)) > 0:
                 suffix = " (restarted)"
             else:
@@ -807,17 +951,25 @@ class AgentOSDashboard(App[None]):
     @staticmethod
     def _format_agent_tree(hierarchy: dict[str, Any] | None) -> str:
         if not hierarchy:
-            return "[dim]No active hierarchy[/]"
+            return "[dim]No active hierarchy. Running agents will appear here.[/]"
 
         supervisor = str(hierarchy.get("supervisor", "")).strip()
         children = [str(child) for child in hierarchy.get("children", [])]
         if not supervisor:
-            return "[dim]No active hierarchy[/]"
+            return "[dim]No active hierarchy. Running agents will appear here.[/]"
 
-        lines = [f"[bold]{supervisor}[/]"]
+        lines = [f"[bold #c9eeff]SUP[/] [bold]{supervisor}[/]"]
         for index, child in enumerate(children):
-            connector = "└──" if index == len(children) - 1 else "├──"
-            lines.append(f"{connector} {child}")
+            connector = "`--" if index == len(children) - 1 else "|--"
+            if child.endswith(" (restarted)"):
+                marker = "[bold #8bd5ff]RST[/]"
+            elif child.endswith(" (terminated)"):
+                marker = "[dim #ff8a8a]STOP[/]"
+            elif child.endswith(" (failed)") or child.endswith(" (crashed)"):
+                marker = "[bold #ff6b6b]FAIL[/]"
+            else:
+                marker = "[#8cffb5]RUN[/]"
+            lines.append(f"{connector} {marker} {child}")
         return "\n".join(lines)
 
     def _read_mailboxes(self) -> list[MailboxMetric]:

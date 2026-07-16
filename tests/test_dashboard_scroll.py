@@ -1,9 +1,10 @@
 from types import SimpleNamespace
 
 import pytest
-from textual.widgets import DataTable, RichLog, Static
+from textual.widgets import DataTable, Input, RichLog, Static
 
 from kernel.dashboard import AgentOSDashboard, MailboxMetric
+from kernel.events import RuntimeEvent
 from main import format_external_agent_run
 
 
@@ -18,6 +19,56 @@ def make_dashboard() -> AgentOSDashboard:
         memory=EmptyTelemetry(),
         sandbox=EmptyTelemetry(),
     )
+
+
+@pytest.mark.asyncio
+async def test_dashboard_chrome_surfaces_branded_system_summary() -> None:
+    dashboard = make_dashboard()
+    dashboard.refresh_metrics = lambda: None  # type: ignore[method-assign]
+    dashboard._process_rows = [
+        {"pid": 101, "name": "Planner", "status": "running", "restart_count": 1}
+    ]
+    dashboard._runtime_events = [
+        RuntimeEvent.info(
+            "ToolRuntime",
+            "tool.execution_requested",
+            "Tool requested",
+            {"tool_call_id": "call-1"},
+        )
+    ]
+
+    async with dashboard.run_test(size=(120, 36)) as pilot:
+        dashboard._render_status([])
+        await pilot.pause(0)
+
+        status = str(dashboard.query_one("#status-bar", Static).render())
+        prompt = dashboard.query_one("#shell-input", Input)
+        assert dashboard.title == "Sulcus OS"
+        assert "SULCUS OS" in status
+        assert "HEALTH" in status
+        assert "AGENTS" in status
+        assert "TOOL CALLS" in status
+        assert "TOKENS" in status
+        assert "RECOVERED" in status
+        assert "Sulcus>" in prompt.placeholder
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [(120, 36), (80, 24)])
+async def test_primary_dashboard_panels_remain_usable_at_terminal_sizes(
+    size: tuple[int, int],
+) -> None:
+    dashboard = make_dashboard()
+    dashboard.refresh_metrics = lambda: None  # type: ignore[method-assign]
+
+    async with dashboard.run_test(size=size) as pilot:
+        await pilot.pause(0)
+
+        for selector in ("#agent-tree-pane", "#timeline-pane", "#process-pane", "#wasm-pane"):
+            panel = dashboard.query_one(selector)
+            assert panel.region.width >= 20
+            assert panel.region.height >= 7
+        assert dashboard.query_one("#shell-input", Input).region.height == 3
 
 
 def process_rows(count: int, *, suffix: str = "") -> list[dict[str, object]]:
@@ -56,7 +107,7 @@ async def test_execution_panel_renders_external_lifecycle_and_has_useful_height(
         title = str(dashboard.query_one("#wasm-pane .pane-title", Static).render())
 
         assert log.region.height >= 7
-        assert "Execution / WASM Isolation Monitor" in title
+        assert "Tool / LLM Activity" in title
         assert "Manifest validated" in output
         assert "Agent loaded" in output
         assert "Lifecycle executed" in output

@@ -12,7 +12,7 @@ class EmptyTelemetry:
 
 
 def test_dashboard_uses_branded_shell_prompt() -> None:
-    assert SHELL_PROMPT == "AgentOS>"
+    assert SHELL_PROMPT == "Sulcus>"
 
 
 def test_empty_dashboard_tree_shows_placeholder() -> None:
