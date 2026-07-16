@@ -249,7 +249,7 @@ class AgentOSDashboard(App[None]):
 
     def load_research_team_snapshot(self, state: dict[str, Any]) -> None:
         self._logged_supervision_events = 0
-        self._demo_supervision_events = None
+        self._demo_supervision_events = list(state.get("events") or ())
         self._demo_page_tables = None
         assignments = state.get("assignments", ())
         research_agents = state.get("research_agents", ())

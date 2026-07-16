@@ -1,11 +1,13 @@
 import pytest
 from rich.text import Text
+from textual.widgets import DataTable, Static
 
 from examples.research_team.agents import PlannerAgent, SynthesizerAgent
 from examples.research_team.contracts import ResearchResult
 from examples.research_team.data import BENEFITS, CRITIC_REVIEW, MARKET_TRENDS, RISKS, TOPIC
 from examples.research_team.research_team import run_demo
 from kernel.dashboard import SHELL_PROMPT, AgentOSDashboard
+from kernel.events import RuntimeEvent
 
 
 class EmptyTelemetry:
@@ -131,6 +133,33 @@ async def test_full_workflow_returns_major_artifacts() -> None:
 
 
 @pytest.mark.asyncio
+async def test_research_team_records_real_workflow_events_in_execution_order() -> None:
+    state = await run_demo()
+    events = state["events"]
+
+    assert all(isinstance(event, RuntimeEvent) for event in events)
+    assert [(event.event_type, event.metadata["agent"]) for event in events] == [
+        ("workflow_started", "ResearchTeamSupervisor"),
+        ("agent_work_started", "PlannerAgent"),
+        ("agent_work_completed", "PlannerAgent"),
+        ("agent_work_started", "ResearchBenefitsAgent"),
+        ("agent_work_completed", "ResearchBenefitsAgent"),
+        ("agent_work_started", "ResearchRisksAgent"),
+        ("agent_work_completed", "ResearchRisksAgent"),
+        ("agent_work_started", "ResearchMarketAgent"),
+        ("agent_work_completed", "ResearchMarketAgent"),
+        ("agent_work_started", "SynthesizerAgent"),
+        ("agent_work_completed", "SynthesizerAgent"),
+        ("agent_work_started", "CriticAgent"),
+        ("agent_work_completed", "CriticAgent"),
+        ("workflow_completed", "ResearchTeamSupervisor"),
+    ]
+    assert [event.timestamp for event in events] == sorted(event.timestamp for event in events)
+    assert all(event.timestamp.utcoffset() is not None for event in events)
+    assert all(set(event.metadata) == {"agent"} for event in events)
+
+
+@pytest.mark.asyncio
 async def test_dashboard_snapshot_shows_completed_research_team_workflow() -> None:
     state = await run_demo()
     dashboard = AgentOSDashboard(
@@ -143,6 +172,8 @@ async def test_dashboard_snapshot_shows_completed_research_team_workflow() -> No
     dashboard.load_research_team_snapshot(state)
 
     assert dashboard._demo_status == "Workflow Complete  Final Score: 8.7/10"
+    assert dashboard._demo_supervision_events == state["events"]
+    assert dashboard._observable_events() == state["events"]
     assert [row["name"] for row in dashboard._demo_process_rows] == [
         "PlannerAgent",
         "ResearchBenefitsAgent",
@@ -157,6 +188,45 @@ async def test_dashboard_snapshot_shows_completed_research_team_workflow() -> No
         ("SynthesizerAgent", 1),
         ("CriticAgent", 1),
     ]
+
+
+@pytest.mark.asyncio
+async def test_research_team_dashboard_renders_timeline_without_duplicate_events() -> None:
+    state = await run_demo()
+    dashboard = AgentOSDashboard(
+        kernel=EmptyTelemetry(),
+        bus=EmptyTelemetry(),
+        memory=EmptyTelemetry(),
+        sandbox=EmptyTelemetry(),
+    )
+    dashboard.refresh_metrics = lambda: None  # type: ignore[method-assign]
+
+    async with dashboard.run_test(size=(120, 36)) as pilot:
+        dashboard.load_research_team_snapshot(state)
+        dashboard._render_timeline()
+        dashboard._render_timeline()
+        dashboard._render_agent_tree()
+        dashboard._render_processes(dashboard._demo_process_rows)
+        dashboard._render_mailboxes(dashboard._demo_mailboxes)
+        dashboard._render_status(dashboard._demo_mailboxes)
+        await pilot.pause(0)
+
+        timeline = str(dashboard.query_one("#runtime-timeline", Static).render())
+        tree = str(dashboard.query_one("#agent-tree", Static).render())
+        processes = dashboard.query_one("#process-table", DataTable)
+        ipc = dashboard.query_one("#ipc-table", DataTable)
+        status = str(dashboard.query_one("#status-bar", Static).render())
+
+        assert timeline.count("workflow_started") == 1
+        assert timeline.count("workflow_completed") == 1
+        assert timeline.count("agent_work_started") == 6
+        assert timeline.count("agent_work_completed") == 6
+        assert "research_team_supervisor" in timeline
+        assert "planner_agent" in timeline
+        assert "ResearchTeamSupervisor" in tree
+        assert processes.row_count == 6
+        assert ipc.row_count == 4
+        assert "Workflow Complete" in status
 
 
 @pytest.mark.asyncio

@@ -6,6 +6,8 @@ from typing import Any
 
 from kernel.process import AgentMessage
 
+from .runtime_events import emit_demo_event
+
 from .agents import (
     CriticAgent,
     PlannerAgent,
@@ -43,6 +45,12 @@ async def run_demo() -> dict[str, Any]:
     print("=" * 64)
     print("[SUPERVISOR] Research Team Started")
     print("\n--- IPC Workflow ---")
+    runtime_events = []
+    emit_demo_event(
+        runtime_events.append,
+        "workflow_started",
+        "ResearchTeamSupervisor",
+    )
     bus = DemoBus()
     research_agents = [
         ResearchBenefitsAgent(),
@@ -55,6 +63,7 @@ async def run_demo() -> dict[str, Any]:
     agents = [planner, *research_agents, synthesizer, critic]
     for pid, agent in enumerate(agents, start=100):
         bus.attach(pid, agent)
+        agent.runtime_event_sink = runtime_events.append
 
     planner.research_pids = {
         "ResearchBenefitsAgent": research_agents[0].pid,
@@ -91,6 +100,11 @@ async def run_demo() -> dict[str, Any]:
         print("[SUPERVISOR] Workflow Complete")
         print(f"[SUPERVISOR] Final Score: {critic.review.score}/10")
         print("=" * 64)
+        emit_demo_event(
+            runtime_events.append,
+            "workflow_completed",
+            "ResearchTeamSupervisor",
+        )
         hierarchy = {
             "supervisor": "ResearchTeamSupervisor",
             "children": [
@@ -111,6 +125,7 @@ async def run_demo() -> dict[str, Any]:
             "research_agents": research_agents,
             "synthesizer": synthesizer,
             "critic": critic,
+            "events": runtime_events,
         }
     finally:
         for agent in agents:
