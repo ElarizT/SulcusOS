@@ -190,7 +190,7 @@ import `agent_os_core` directly from application code.
 
 ## Public and internal boundaries
 
-The intended pre-v1 public surface is:
+The intended v1 public surface is:
 
 - `agentos` for the compact process, IPC, tool-loop, and capability facade.
 - `agentos.runtime`, `agentos.tools`, `agentos.ipc`, and `agentos.native` as the

@@ -1,8 +1,9 @@
 # Installation
 
-Sulcus OS uses `sulcus-os` as its future Python distribution name and
-`agentos` as its backward-compatible import package. The project remains
-pre-v1 and is currently installed from source; it is not published to PyPI.
+Sulcus OS uses `sulcus-os` as its Python distribution name and `agentos` as
+its backward-compatible import package. Version 1.0.0rc1 is a release
+candidate available from source or locally built artifacts; it is not
+published to PyPI.
 The source distribution currently declares `LicenseRef-Unlicensed`; obtain a
 license grant from the repository owner before redistributing it.
 

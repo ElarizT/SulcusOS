@@ -1,6 +1,6 @@
 # Sulcus OS
 
-Sulcus OS is a pre-v1 agent runtime for building restart-safe, observable workflows with process-like agents, registered tools, approvals, permissions, and bounded execution.
+Sulcus OS is a v1.0 release-candidate agent runtime for building restart-safe, observable workflows with process-like agents, registered tools, approvals, permissions, and bounded execution.
 
 Agent libraries are good at describing what an agent should do. Sulcus exists to make the execution around that agent explicit: who owns it, which tools it may call, when a human must approve, what limits apply, what happened, and how a paused run can survive a restart. It is runtime infrastructure rather than a prompt, chain, graph, or multi-agent framework.
 
@@ -112,7 +112,7 @@ performance superiority over those projects.
 
 ## Maturity and limitations
 
-Sulcus is alpha-quality, pre-v1 software. The intended stable surface is the
+Sulcus 1.0.0rc1 is release-candidate software. The intended v1 stable surface is the
 top-level `agentos` package plus `agentos.runtime`, `agentos.tools`,
 `agentos.ipc`, and `agentos.native`. `agentos.llm` is an advanced public API
 that may evolve with documented migration guidance. `kernel.*` is internal.

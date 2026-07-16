@@ -93,5 +93,5 @@ memory, stream, and cost signals; the event model itself is usable in Python.
 - **Experimental/internal:** `kernel.*`, dashboard composition, native services,
   WASM toolchain, replay/dependency views, and external-agent loading.
 
-All surfaces remain pre-v1. "Intended stable" describes the compatibility
-direction, not a permanent semantic-versioning promise before 1.0.
+Version 1.0.0rc1 freezes the intended stable surface for release-candidate
+validation. Advanced and internal surfaces retain the qualifications above.

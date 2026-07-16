@@ -5,13 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sulcus-os"
 dynamic = ["version"]
-description = "Python APIs for the experimental Sulcus OS agent runtime."
+description = "Python APIs for the Sulcus OS agent runtime."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "LicenseRef-Unlicensed"
 keywords = ["agents", "llm", "orchestration", "tools", "runtime"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
