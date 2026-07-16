@@ -64,14 +64,16 @@ _METADATA_KEYS = (
 
 def format_timeline_event(event: RuntimeEvent) -> str:
     """Format one structured event as a compact UTC timeline row."""
-    timestamp = event.timestamp.astimezone(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
-    category, action = _event_parts(event)
+    timestamp = event.timestamp.astimezone(timezone.utc).strftime("%H:%M:%S")
+    category, _ = _event_parts(event)
+    action = _normalize(event.event_type)
     subject = _event_subject(event)
     metadata = _metadata_summary(
         event.metadata,
         include_approval_fields="approval" in event.event_type or "paused" in event.event_type or "resumed" in event.event_type,
     )
-    row = f"{timestamp}  {category:<16} {subject:<18} {action}"
+    category_label = "" if category in action else f"  {category}"
+    row = f"{timestamp}  {action:<31} {subject:<18}{category_label}"
     return f"{row}  {metadata}" if metadata else row
 
 
@@ -87,7 +89,7 @@ def render_runtime_timeline(events: Iterable[Any], limit: int | None = None) -> 
 
     structured.sort(key=lambda item: (item[1].timestamp, item[0]))
     rows = [format_timeline_event(event) for _, event in structured]
-    rows.extend(_format_legacy_event(event) for _, event in legacy)
+    rows.extend(f"#{index + 1:03d}  {_format_legacy_event(event)}" for index, event in legacy)
     if limit is None:
         return rows
     if limit <= 0:

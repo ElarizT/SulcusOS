@@ -83,6 +83,12 @@ class AgentOSDashboard(App[None]):
         color: #7086a6;
     }
 
+    .section-title {
+        background: #0d121b;
+        color: #93a8c6;
+        padding: 0 1;
+    }
+
     .optional-monitor {
         display: none;
     }
@@ -127,8 +133,15 @@ class AgentOSDashboard(App[None]):
 
     #wasm-log {
         height: 1fr;
-        min-height: 5;
+        min-height: 3;
         background: #080b0f;
+        overflow: auto;
+    }
+
+    #console-log {
+        height: 2;
+        min-height: 2;
+        background: #0b1018;
         overflow: auto;
     }
 
@@ -209,7 +222,6 @@ class AgentOSDashboard(App[None]):
         self.command_handler = command_handler
         self.process_snapshot = process_snapshot
         self.supervision_event_snapshot = supervision_event_snapshot
-        self._heartbeat_index = 0
         self._last_pending_evictions: dict[str, int] = {}
         self._logged_wasm_runs = 0
         self._logged_supervision_events = 0
@@ -353,7 +365,7 @@ class AgentOSDashboard(App[None]):
                 )
                 yield Static(id="execution-replay", classes="optional-monitor")
             with Vertical(id="process-pane", classes="pane"):
-                yield Static("Process Registry", classes="pane-title primary-title")
+                yield Static("Processes / IPC", classes="pane-title primary-title")
                 yield DataTable(id="process-table")
                 yield Static(
                     "[dim]No processes registered. Use the command bar to launch an agent.[/]",
@@ -362,22 +374,30 @@ class AgentOSDashboard(App[None]):
                 yield Static(
                     "Agent Metrics",
                     id="metrics-title",
-                    classes="pane-title secondary-title optional-monitor",
+                    classes="pane-title section-title optional-monitor",
                 )
                 yield Static(id="agent-metrics", classes="optional-monitor")
                 yield Static(
-                    "IPC Queues", id="ipc-title", classes="pane-title secondary-title optional-monitor"
+                    "IPC Queues", id="ipc-title", classes="pane-title section-title optional-monitor"
                 )
                 yield DataTable(id="ipc-table", classes="optional-monitor")
                 yield Static(
                     "IPC Inspector",
                     id="ipc-inspector-title",
-                    classes="pane-title secondary-title optional-monitor",
+                    classes="pane-title section-title optional-monitor",
                 )
                 yield Static(id="ipc-inspector", classes="optional-monitor")
             with Vertical(id="wasm-pane", classes="pane"):
                 yield Static("Tool / LLM Activity", classes="pane-title primary-title")
                 yield RichLog(id="wasm-log", markup=True, wrap=True, highlight=True, auto_scroll=False)
+                yield Static("Console", id="console-title", classes="pane-title section-title")
+                yield RichLog(
+                    id="console-log",
+                    markup=True,
+                    wrap=True,
+                    highlight=True,
+                    auto_scroll=False,
+                )
                 yield Static(
                     "LLM Stream Monitor",
                     id="llm-stream-title",
@@ -418,10 +438,10 @@ class AgentOSDashboard(App[None]):
         event.input.value = ""
         if not command:
             return
-        self._write_execution_log(f"[bold #8bd5ff]{SHELL_PROMPT}[/] {command}")
+        self._write_console_log(f"[bold #8bd5ff]{SHELL_PROMPT}[/] {command}")
 
         if self.command_handler is None:
-            self._write_execution_log("[yellow]No command handler is attached.[/]")
+            self._write_console_log("[yellow]No command handler is attached.[/]")
             return
 
         try:
@@ -429,11 +449,11 @@ class AgentOSDashboard(App[None]):
             if hasattr(result, "__await__"):
                 result = await result  # type: ignore[assignment,misc]
         except Exception as exc:
-            self._write_execution_log(f"[bold red]error:[/] {exc}")
+            self._write_console_log(f"[bold red]error:[/] {exc}")
             return
 
         if result:
-            self._write_execution_log(str(result))
+            self._write_console_log(str(result))
 
     def refresh_metrics(self) -> None:
         mailboxes = self._read_mailboxes()
@@ -477,10 +497,6 @@ class AgentOSDashboard(App[None]):
         self._render_agent_metrics()
 
     def _render_status(self, mailboxes: list[MailboxMetric]) -> None:
-        heartbeats = ["|", "/", "-", "\\"]
-        self._heartbeat_index = (self._heartbeat_index + 1) % len(heartbeats)
-        heartbeat = heartbeats[self._heartbeat_index]
-
         process_rows = (
             self._demo_process_rows
             if self._demo_process_rows is not None
@@ -505,30 +521,40 @@ class AgentOSDashboard(App[None]):
             str(row.get("status", "")).lower() in {"running", "starting"}
             for row in process_rows
         )
-        failed_agents = sum(
-            str(row.get("status", "")).lower() in {"crashed", "failed"}
-            for row in process_rows
-        )
-        restarted_agents = sum(int(row.get("restart_count", 0) or 0) > 0 for row in process_rows)
         tool_calls = self._tool_call_count(self._observable_events())
-        if failed_agents or (self._demo_status and "failed" in self._demo_status.lower()):
-            health = "DEGRADED"
-            health_style = "bold #ff6b6b"
-        elif restarted_agents:
-            health = "RECOVERED"
-            health_style = "bold #ffd166"
-        else:
-            health = "ONLINE"
-            health_style = "bold #8cffb5"
+        health = self._health_state(process_rows, self._demo_status)
+        health_style = {
+            "HEALTHY": "bold #8cffb5",
+            "PARTIAL": "bold #ffd166",
+            "DEGRADED": "bold #ff9f43",
+            "FAILED": "bold #ff6b6b",
+        }[health]
 
         self.query_one("#status-bar", Static).update(
-            f"[bold #8bd5ff]SULCUS OS[/]  "
-            f"[dim]HEALTH[/] [{health_style}]{heartbeat} {health}[/]  [#3b4b62]|[/]  "
-            f"[dim]AGENTS[/] [bold]{active_agents}/{total_agents} active[/]  "
-            f"[dim]TOOL CALLS[/] [bold]{tool_calls}[/]  "
-            f"[dim]TOKENS[/] [bold]{active_tokens} active[/]"
+            f"[bold #8bd5ff]SULCUS OS[/]   "
+            f"[dim]HEALTH[/] [{health_style}]{health:<8}[/]  [#3b4b62]|[/]  "
+            f"[dim]AGENTS[/] [bold]{active_agents}/{total_agents}[/]  [#3b4b62]|[/]  "
+            f"[dim]TOOL CALLS[/] [bold]{tool_calls}[/]  [#3b4b62]|[/]  "
+            f"[dim]TOKENS[/] [bold]{active_tokens}[/]"
             f"{'  [#3b4b62]|[/]  [bold #c9eeff]' + self._demo_status + '[/]' if self._demo_status else ''}"
         )
+
+    @staticmethod
+    def _health_state(process_rows: list[dict[str, Any]], demo_status: str | None) -> str:
+        """Map observed presentation state to one stable dashboard health label."""
+        statuses = [str(row.get("status", "")).lower() for row in process_rows]
+        failed = sum(status in {"crashed", "failed"} for status in statuses)
+        active = sum(status in {"running", "starting"} for status in statuses)
+        restarted = any(int(row.get("restart_count", 0) or 0) > 0 for row in process_rows)
+        explicitly_failed = bool(demo_status and "failed" in demo_status.lower())
+
+        if explicitly_failed or (statuses and failed == len(statuses)):
+            return "FAILED"
+        if failed and not active:
+            return "DEGRADED"
+        if failed or restarted or "stopping" in statuses:
+            return "PARTIAL"
+        return "HEALTHY"
 
     @staticmethod
     def _tool_call_count(events: list[Any]) -> int:
@@ -869,8 +895,20 @@ class AgentOSDashboard(App[None]):
         return "TERMINATED" if status == "killed" else status.upper()
 
     def _render_agent_tree(self) -> None:
-        hierarchy = self._demo_hierarchy or self._hierarchy_from_process_rows(self._process_rows)
-        self._update_scrollable_static("#agent-tree", self._format_agent_tree(hierarchy))
+        rows = (
+            self._demo_process_rows
+            if self._demo_process_rows is not None
+            else self._process_rows
+        )
+        hierarchy = self._demo_hierarchy or self._hierarchy_from_process_rows(rows)
+        states = {
+            str(row.get("name", "")): self._agent_tree_state(row)
+            for row in rows
+            if row.get("name")
+        }
+        self._update_scrollable_static(
+            "#agent-tree", self._format_agent_tree(hierarchy, states=states)
+        )
 
     def _update_scrollable_static(self, selector: str, content: str) -> None:
         if self._scrollable_content.get(selector) == content:
@@ -903,6 +941,13 @@ class AgentOSDashboard(App[None]):
         log = self.query_one("#wasm-log", RichLog)
         if isinstance(content, RuntimeEvent):
             content = render_runtime_event(content)
+        if scroll_end is None:
+            scroll_end = log.is_vertical_scroll_end
+        log.write(content, scroll_end=scroll_end)
+
+    def _write_console_log(self, content: Any, *, scroll_end: bool | None = None) -> None:
+        """Write interactive shell output without mixing it into runtime telemetry."""
+        log = self.query_one("#console-log", RichLog)
         if scroll_end is None:
             scroll_end = log.is_vertical_scroll_end
         log.write(content, scroll_end=scroll_end)
@@ -949,7 +994,9 @@ class AgentOSDashboard(App[None]):
         return {"supervisor": supervisor.get("name", ""), "children": children}
 
     @staticmethod
-    def _format_agent_tree(hierarchy: dict[str, Any] | None) -> str:
+    def _format_agent_tree(
+        hierarchy: dict[str, Any] | None, *, states: dict[str, str] | None = None
+    ) -> str:
         if not hierarchy:
             return "[dim]No active hierarchy. Running agents will appear here.[/]"
 
@@ -958,19 +1005,56 @@ class AgentOSDashboard(App[None]):
         if not supervisor:
             return "[dim]No active hierarchy. Running agents will appear here.[/]"
 
-        lines = [f"[bold #c9eeff]SUP[/] [bold]{supervisor}[/]"]
+        states = states or {}
+        markers = {
+            "running": "[#8cffb5]\\[>][/]",
+            "restarted": "[bold #8bd5ff]\\[R][/]",
+            "failed": "[bold #ff6b6b]\\[!][/]",
+            "completed": "[#8cffb5]\\[+][/]",
+            "terminated": "[dim #ff8a8a]\\[X][/]",
+            "unknown": "[dim]\\[?][/]",
+        }
+        supervisor_state = states.get(supervisor, "running")
+        lines = [
+            f"[bold #c9eeff]\\[SUP][/] {markers.get(supervisor_state, markers['unknown'])} "
+            f"[bold]{supervisor}[/]"
+        ]
         for index, child in enumerate(children):
             connector = "`--" if index == len(children) - 1 else "|--"
+            name = child
             if child.endswith(" (restarted)"):
-                marker = "[bold #8bd5ff]RST[/]"
+                name = child.removesuffix(" (restarted)")
+                fallback_state = "restarted"
             elif child.endswith(" (terminated)"):
-                marker = "[dim #ff8a8a]STOP[/]"
+                name = child.removesuffix(" (terminated)")
+                fallback_state = "terminated"
             elif child.endswith(" (failed)") or child.endswith(" (crashed)"):
-                marker = "[bold #ff6b6b]FAIL[/]"
+                name = child.rsplit(" (", 1)[0]
+                fallback_state = "failed"
+            elif child.endswith(" (completed)"):
+                name = child.removesuffix(" (completed)")
+                fallback_state = "completed"
             else:
-                marker = "[#8cffb5]RUN[/]"
+                fallback_state = "running"
+            state = states.get(name, fallback_state)
+            marker = markers.get(state, markers["unknown"])
             lines.append(f"{connector} {marker} {child}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _agent_tree_state(row: dict[str, Any]) -> str:
+        status = str(row.get("status", "unknown")).lower()
+        if status in {"crashed", "failed"}:
+            return "failed"
+        if status == "killed":
+            return "terminated"
+        if status in {"exited", "completed", "complete"}:
+            return "completed"
+        if status == "running" and int(row.get("restart_count", 0) or 0) > 0:
+            return "restarted"
+        if status in {"running", "starting", "stopping"}:
+            return "running"
+        return "unknown"
 
     def _read_mailboxes(self) -> list[MailboxMetric]:
         if self._demo_mailboxes is not None:

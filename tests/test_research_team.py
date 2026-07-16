@@ -1,4 +1,5 @@
 import pytest
+from rich.text import Text
 
 from examples.research_team.agents import PlannerAgent, SynthesizerAgent
 from examples.research_team.contracts import ResearchResult
@@ -19,6 +20,31 @@ def test_empty_dashboard_tree_shows_placeholder() -> None:
     tree = AgentOSDashboard._format_agent_tree(None)
 
     assert "No active hierarchy" in tree
+
+
+def test_agent_tree_uses_consistent_state_markers() -> None:
+    tree = AgentOSDashboard._format_agent_tree(
+        {
+            "supervisor": "Supervisor",
+            "children": ["Running", "Restarted", "Failed", "Completed", "Terminated"],
+        },
+        states={
+            "Supervisor": "running",
+            "Running": "running",
+            "Restarted": "restarted",
+            "Failed": "failed",
+            "Completed": "completed",
+            "Terminated": "terminated",
+        },
+    )
+    plain = Text.from_markup(tree).plain
+
+    assert "[SUP] [>] Supervisor" in plain
+    assert "[>] Running" in plain
+    assert "[R] Restarted" in plain
+    assert "[!] Failed" in plain
+    assert "[+] Completed" in plain
+    assert "[X] Terminated" in plain
 
 
 def test_planner_creates_expected_assignments() -> None:

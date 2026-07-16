@@ -49,8 +49,40 @@ async def test_dashboard_chrome_surfaces_branded_system_summary() -> None:
         assert "AGENTS" in status
         assert "TOOL CALLS" in status
         assert "TOKENS" in status
-        assert "RECOVERED" in status
+        assert "PARTIAL" in status
         assert "Sulcus>" in prompt.placeholder
+
+
+def test_dashboard_health_states_follow_runtime_conditions() -> None:
+    health = AgentOSDashboard._health_state
+
+    assert health([], None) == "HEALTHY"
+    assert health([{"status": "killed"}], None) == "HEALTHY"
+    assert health([{"status": "exited"}], None) == "HEALTHY"
+    assert health([{"status": "running"}, {"status": "crashed"}], None) == "PARTIAL"
+    assert health([{"status": "exited"}, {"status": "crashed"}], None) == "DEGRADED"
+    assert health([{"status": "crashed"}], None) == "FAILED"
+    assert health([{"status": "running"}], "External Agent Failed") == "FAILED"
+
+
+@pytest.mark.asyncio
+async def test_dashboard_header_renders_each_health_transition() -> None:
+    dashboard = make_dashboard()
+    dashboard.refresh_metrics = lambda: None  # type: ignore[method-assign]
+    scenarios = (
+        ([{"status": "killed"}], "HEALTHY"),
+        ([{"status": "running"}, {"status": "crashed"}], "PARTIAL"),
+        ([{"status": "exited"}, {"status": "crashed"}], "DEGRADED"),
+        ([{"status": "crashed"}], "FAILED"),
+    )
+
+    async with dashboard.run_test(size=(80, 24)) as pilot:
+        for rows, expected in scenarios:
+            dashboard._process_rows = rows
+            dashboard._render_status([])
+            await pilot.pause(0)
+            status = str(dashboard.query_one("#status-bar", Static).render())
+            assert expected in status
 
 
 @pytest.mark.asyncio
@@ -68,6 +100,8 @@ async def test_primary_dashboard_panels_remain_usable_at_terminal_sizes(
             panel = dashboard.query_one(selector)
             assert panel.region.width >= 20
             assert panel.region.height >= 7
+        assert dashboard.query_one("#wasm-log", RichLog).region.height >= 2
+        assert dashboard.query_one("#console-log", RichLog).region.height >= 2
         assert dashboard.query_one("#shell-input", Input).region.height == 3
 
 
@@ -112,6 +146,36 @@ async def test_execution_panel_renders_external_lifecycle_and_has_useful_height(
         assert "Agent loaded" in output
         assert "Lifecycle executed" in output
         assert "Completed" in output
+
+
+@pytest.mark.asyncio
+async def test_shell_output_is_separate_from_runtime_telemetry() -> None:
+    dashboard = AgentOSDashboard(
+        kernel=EmptyTelemetry(),
+        bus=EmptyTelemetry(),
+        memory=EmptyTelemetry(),
+        sandbox=EmptyTelemetry(),
+        command_handler=lambda command: f"result for {command}",
+    )
+    dashboard.refresh_metrics = lambda: None  # type: ignore[method-assign]
+
+    async with dashboard.run_test(size=(120, 36)) as pilot:
+        shell = dashboard.query_one("#shell-input", Input)
+        shell.focus()
+        shell.value = "ps"
+        await pilot.press("enter")
+        await pilot.pause(0)
+
+        telemetry = "\n".join(line.text for line in dashboard.query_one("#wasm-log", RichLog).lines)
+        console = "\n".join(line.text for line in dashboard.query_one("#console-log", RichLog).lines)
+        process_title = str(dashboard.query_one("#process-pane .primary-title", Static).render())
+        console_title = str(dashboard.query_one("#console-title", Static).render())
+
+        assert "Sulcus> ps" in console
+        assert "result for ps" in console
+        assert "result for ps" not in telemetry
+        assert "Processes / IPC" in process_title
+        assert "Console" in console_title
 
 
 @pytest.mark.asyncio
@@ -173,6 +237,26 @@ async def test_execution_log_does_not_jump_when_user_scrolled_up() -> None:
         before = log.scroll_y
 
         dashboard._write_execution_log("new telemetry", scroll_end=False)
+        await pilot.pause(0)
+
+        assert log.scroll_y == before
+
+
+@pytest.mark.asyncio
+async def test_console_log_does_not_jump_when_user_scrolled_up() -> None:
+    dashboard = make_dashboard()
+    dashboard.refresh_metrics = lambda: None  # type: ignore[method-assign]
+
+    async with dashboard.run_test(size=(100, 30)) as pilot:
+        log = dashboard.query_one("#console-log", RichLog)
+        for index in range(30):
+            dashboard._write_console_log(f"console {index}", scroll_end=False)
+        await pilot.pause(0)
+        log.scroll_to(y=3, animate=False, force=True)
+        await pilot.pause(0)
+        before = log.scroll_y
+
+        dashboard._write_console_log("new shell output", scroll_end=False)
         await pilot.pause(0)
 
         assert log.scroll_y == before

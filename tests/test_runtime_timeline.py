@@ -29,7 +29,7 @@ def make_dashboard() -> AgentOSDashboard:
     return AgentOSDashboard(kernel=object(), bus=object(), memory=object(), sandbox=object())
 
 
-def test_format_timeline_event_is_compact_and_includes_milliseconds() -> None:
+def test_format_timeline_event_is_compact_and_action_first() -> None:
     row = format_timeline_event(
         event(
             15,
@@ -40,10 +40,9 @@ def test_format_timeline_event_is_compact_and_includes_milliseconds() -> None:
         )
     )
 
-    assert row.startswith("12:01:15.123")
-    assert "external_agent" in row
+    assert row.startswith("12:01:15  external_agent_loaded")
+    assert row.index("external_agent_loaded") < row.index("planner")
     assert "planner" in row
-    assert row.endswith("loaded")
 
 
 def test_render_runtime_timeline_orders_structured_events_chronologically() -> None:
@@ -53,7 +52,7 @@ def test_render_runtime_timeline_orders_structured_events_chronologically() -> N
 
     rows = render_runtime_timeline([completed, loaded, started])
 
-    assert [row[:12] for row in rows] == ["12:01:15.123", "12:01:16.123", "12:01:17.123"]
+    assert [row[:8] for row in rows] == ["12:01:15", "12:01:16", "12:01:17"]
 
 
 def test_timeline_metadata_summary_includes_scalars_and_omits_nested_values() -> None:
@@ -206,7 +205,7 @@ def test_timeline_safely_renders_legacy_strings_and_dictionaries() -> None:
         ]
     )
 
-    assert rows == ["legacy log string", "child_restarted Child restarted"]
+    assert rows == ["#001  legacy log string", "#002  child_restarted Child restarted"]
 
 
 def test_timeline_limit_returns_latest_rows_after_ordering() -> None:
@@ -225,7 +224,7 @@ def test_timeline_limit_returns_latest_rows_after_ordering() -> None:
 
     rows = render_runtime_timeline(events, limit=2)
 
-    assert [row[:12] for row in rows] == ["12:01:12.123", "12:01:13.123"]
+    assert [row[:8] for row in rows] == ["12:01:12", "12:01:13"]
 
 
 @pytest.mark.asyncio
@@ -250,7 +249,7 @@ async def test_dashboard_renders_visible_runtime_timeline() -> None:
         timeline = str(dashboard.query_one("#runtime-timeline", Static).render())
 
         assert "Runtime Timeline" in title
-        assert "12:01:15.123" in timeline
+        assert "12:01:15" in timeline
         assert "external_agent" in timeline
         assert "planner" in timeline
         assert "pid=1234" in timeline
